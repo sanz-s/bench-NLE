@@ -1,0 +1,40 @@
+{
+  "name": "nle-mediabunny-export-benchmarking",
+  "private": true,
+  "version": "0.0.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc -b && vite build",
+    "typecheck": "tsc -b",
+    "lint": "oxlint",
+    "preview": "vite preview",
+    "bench:server": "node bench-server/server.mjs",
+    "bench": "npm run build && node bench/run.mjs",
+    "test:ui": "npm run build && node bench/ui-smoke.mjs && node bench/effects-smoke.mjs",
+    "bench:matrix": "npm run build && node bench/run.mjs --matrix",
+    "bench:fx": "npm run build && node bench/fx-catalog.mjs"
+  },
+  "dependencies": {
+    "@mediabunny/aac-encoder": "^1.65.2",
+    "@mediabunny/ac3": "^1.65.2",
+    "@mediabunny/dts": "^1.65.2",
+    "@mediabunny/flac-encoder": "^1.65.2",
+    "@mediabunny/mp3-encoder": "^1.65.2",
+    "@mediabunny/prores": "^1.65.2",
+    "@mediabunny/truehd": "^1.65.2",
+    "mediabunny": "^1.65.2",
+    "react": "^19.3.1",
+    "react-dom": "^19.3.1"
+  },
+  "devDependencies": {
+    "@types/node": "^24.19.2",
+    "@types/react": "^19.3.0",
+    "@types/react-dom": "^19.3.0",
+    "@vitejs/plugin-react": "^6.1.2",
+    "oxlint": "^1.90.0",
+    "playwright": "^1.65.0",
+    "typescript": "~7.0.2",
+    "vite": "^8.3.6"
+  }
+}

@@ -1,0 +1,770 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Export Monitor</title>
+<style>
+  :root {
+    color-scheme: dark;
+    --bg: #141518;
+    --surface: #17181b;
+    --panel: #1c1d21;
+    --panel-2: #222328;
+    --line: #2d2e35;
+    --line-2: #3b3c45;
+    --grid: rgba(255, 255, 255, 0.06);
+    --text: #e8e8ec;
+    --text-2: #a7a8b1;
+    --text-3: #74757e;
+    --accent: #5b8cff;
+    /* categorical slots (dark steps, validated on --surface; fixed order, never cycled) */
+    --s1: #3987e5; /* blue   */
+    --s2: #d95926; /* orange */
+    --s3: #199e70; /* aqua   */
+    --s4: #c98500; /* yellow */
+    --s5: #d55181; /* magenta*/
+    --s6: #008300; /* green  */
+    --s7: #9085e9; /* violet */
+    --s8: #e66767; /* red    */
+    /* status (reserved: always with icon + label) */
+    --good: #0ca30c;
+    --critical: #d03b3b;
+    --warning: #fab219;
+    /* entity colors: an entity keeps its color in every chart */
+    --c-cpu: var(--s1);
+    --c-chrome: var(--s2);
+    --c-gpu: var(--s3);
+    --c-main: var(--s4);
+    --c-mem: var(--s7);
+    --mono: ui-monospace, 'SF Mono', Menlo, Consolas, monospace;
+    font: 500 13px/1.45 system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--text); -webkit-font-smoothing: antialiased; }
+  button, input, select { font: inherit; color: inherit; }
+  button { cursor: pointer; }
+  button:disabled { opacity: 0.45; cursor: not-allowed; }
+  :focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+  .wrap { max-width: 1320px; margin: 0 auto; padding: 18px 16px 60px; }
+  header.top { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; margin-bottom: 18px; }
+  header.top h1 { font-size: 18px; margin: 0; letter-spacing: 0.01em; }
+  .mark { width: 26px; height: 26px; border-radius: 7px; background: linear-gradient(135deg, var(--accent), #9b6bff); display: grid; place-items: center; }
+  .env { color: var(--text-3); font-size: 12px; }
+  .spacer { flex: 1; }
+  .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--text-3); display: inline-block; }
+  .dot.live { background: var(--good); box-shadow: 0 0 0 3px rgba(12, 163, 12, 0.2); animation: pulse 1.4s infinite; }
+  @keyframes pulse { 50% { box-shadow: 0 0 0 6px rgba(12, 163, 12, 0.05); } }
+  h2 { font-size: 12px; text-transform: uppercase; letter-spacing: 0.07em; color: var(--text-2); margin: 26px 0 10px; display: flex; align-items: center; gap: 8px; }
+  .card { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; }
+  .pad { padding: 14px; }
+  .muted { color: var(--text-2); }
+  .small { font-size: 12px; }
+  .mono { font-family: var(--mono); font-variant-numeric: tabular-nums; }
+  .badge { display: inline-block; padding: 0 7px; border-radius: 4px; font-family: var(--mono); font-size: 11px; line-height: 19px; background: var(--panel-2); color: var(--text-2); border: 1px solid var(--line); }
+  .badge.kind-export { color: #a9c1ff; border-color: rgba(57, 135, 229, 0.4); }
+  .badge.kind-convert { color: #7fd8b2; border-color: rgba(25, 158, 112, 0.45); }
+  .ok { color: #59d659; }
+  .bad { color: #ff8a8a; }
+
+  /* live */
+  .waiting { display: flex; align-items: center; gap: 14px; padding: 26px 18px; }
+  .waiting .big { font-size: 15px; font-weight: 600; }
+  .live-head { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; padding: 14px 14px 0; }
+  .live-head .title { font-size: 15px; font-weight: 650; }
+  .progress { margin: 12px 14px 0; height: 8px; border-radius: 99px; background: var(--panel-2); overflow: hidden; }
+  .progress > div { height: 100%; background: var(--accent); border-radius: 99px; transition: width 300ms linear; }
+  .progress-meta { display: flex; gap: 16px; padding: 6px 14px 0; color: var(--text-2); font-size: 12px; }
+  .tiles { display: grid; grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); gap: 10px; padding: 14px; }
+  .tile { background: var(--panel-2); border: 1px solid var(--line); border-radius: 8px; padding: 9px 11px; }
+  .tile .k { font-size: 11px; color: var(--text-3); text-transform: uppercase; letter-spacing: 0.05em; display: flex; align-items: center; gap: 6px; }
+  .tile .v { font-family: var(--mono); font-size: 19px; font-variant-numeric: tabular-nums; margin-top: 2px; }
+  .tile .sub { font-size: 11px; color: var(--text-3); }
+  .swatch { width: 9px; height: 9px; border-radius: 2px; display: inline-block; flex: none; }
+  .charts { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; padding: 0 14px 14px; }
+  .chart { background: var(--surface); border: 1px solid var(--line); border-radius: 8px; padding: 10px 12px 8px; position: relative; }
+  .chart-head { display: flex; align-items: baseline; gap: 10px; margin-bottom: 4px; flex-wrap: wrap; }
+  .chart-title { font-weight: 600; font-size: 12.5px; }
+  .legend { display: flex; gap: 12px; flex-wrap: wrap; font-size: 11.5px; color: var(--text-2); }
+  .legend span { display: inline-flex; align-items: center; gap: 5px; }
+  .chart canvas { display: block; width: 100%; height: 170px; }
+  .tip { position: absolute; pointer-events: none; z-index: 5; background: #0d0e10; border: 1px solid var(--line-2); border-radius: 6px; padding: 6px 8px; font-size: 11.5px; white-space: nowrap; box-shadow: 0 8px 24px rgba(0, 0, 0, 0.45); display: none; }
+  .tip .row { display: flex; align-items: center; gap: 6px; }
+  .tip b { font-family: var(--mono); font-weight: 600; }
+
+  /* results */
+  .toolbar { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; padding: 10px 12px; border-bottom: 1px solid var(--line); }
+  .seg { display: inline-flex; border: 1px solid var(--line-2); border-radius: 6px; overflow: hidden; }
+  .seg button { border: 0; background: var(--panel-2); padding: 5px 11px; color: var(--text-2); }
+  .seg button.on { background: rgba(91, 140, 255, 0.18); color: var(--text); }
+  .btn { height: 30px; padding: 0 12px; border-radius: 6px; border: 1px solid var(--line-2); background: var(--panel-2); display: inline-flex; align-items: center; gap: 6px; }
+  .btn:hover:not(:disabled) { border-color: #4d4e58; background: #2a2b31; }
+  .btn.primary { background: #3d6fe8; border-color: var(--accent); color: #fff; font-weight: 600; }
+  .btn.danger:hover:not(:disabled) { border-color: var(--critical); color: #ff9a9a; }
+  input[type='search'] { height: 30px; border-radius: 6px; border: 1px solid var(--line-2); background: var(--panel-2); padding: 0 10px; min-width: 200px; }
+  label.check { display: inline-flex; gap: 6px; align-items: center; color: var(--text-2); font-size: 12px; }
+  .table-wrap { overflow-x: auto; }
+  table.res { width: 100%; border-collapse: collapse; font-size: 12.5px; }
+  table.res th { text-align: left; font-weight: 600; color: var(--text-3); font-size: 11px; text-transform: uppercase; letter-spacing: 0.04em; padding: 8px 10px; border-bottom: 1px solid var(--line); white-space: nowrap; cursor: pointer; user-select: none; position: sticky; top: 0; background: var(--panel); }
+  table.res th.num, table.res td.num { text-align: right; }
+  table.res th[aria-sort='ascending']::after { content: ' ▲'; }
+  table.res th[aria-sort='descending']::after { content: ' ▼'; }
+  table.res td { padding: 8px 10px; border-bottom: 1px solid var(--line); white-space: nowrap; font-variant-numeric: tabular-nums; }
+  table.res td.num { font-family: var(--mono); }
+  table.res tbody tr { cursor: pointer; }
+  table.res tbody tr:hover { background: rgba(255, 255, 255, 0.025); }
+  table.res tbody tr.sel { background: rgba(91, 140, 255, 0.1); }
+  table.res td.job { max-width: 280px; overflow: hidden; text-overflow: ellipsis; }
+  .empty { padding: 26px; text-align: center; color: var(--text-2); }
+  .detail { margin-top: 14px; }
+  .detail-head { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; padding: 14px 14px 0; }
+  .detail-head .title { font-size: 15px; font-weight: 650; }
+  .stages { padding: 4px 14px 14px; }
+  .stackbar { display: flex; gap: 2px; height: 22px; border-radius: 4px; overflow: hidden; margin: 6px 0 8px; background: var(--surface); }
+  .stackbar > div { min-width: 2px; }
+  .stage-legend { display: flex; gap: 14px; flex-wrap: wrap; font-size: 12px; color: var(--text-2); }
+  .stage-legend span { display: inline-flex; gap: 6px; align-items: center; }
+  .kv { display: grid; grid-template-columns: repeat(auto-fill, minmax(290px, 1fr)); gap: 0 24px; padding: 0 14px 14px; font-size: 12.5px; }
+  .kv div { display: flex; justify-content: space-between; gap: 12px; padding: 5px 0; border-bottom: 1px solid var(--line); }
+  .kv dt { color: var(--text-3); flex: none; white-space: pre; }
+  .kv dd { margin: 0; font-family: var(--mono); text-align: right; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .compare-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(300px, 1fr)); gap: 12px; padding: 14px; }
+  .metric { background: var(--surface); border: 1px solid var(--line); border-radius: 8px; padding: 10px 12px; }
+  .metric .name { font-weight: 600; font-size: 12.5px; margin-bottom: 8px; display: flex; justify-content: space-between; }
+  .metric .name small { color: var(--text-3); font-weight: 500; }
+  .hbar { display: grid; grid-template-columns: 22px 1fr 78px; align-items: center; gap: 8px; margin: 5px 0; font-size: 12px; }
+  .hbar .track { height: 14px; background: rgba(255, 255, 255, 0.03); border-radius: 0 4px 4px 0; }
+  .hbar .fill { height: 100%; border-radius: 0 4px 4px 0; min-width: 2px; }
+  .hbar .val { font-family: var(--mono); text-align: right; color: var(--text); }
+  .run-key { display: flex; gap: 14px; flex-wrap: wrap; padding: 0 14px; font-size: 12px; color: var(--text-2); }
+  .run-key span { display: inline-flex; gap: 6px; align-items: center; }
+  .num-chip { display: inline-grid; place-items: center; width: 18px; height: 18px; border-radius: 4px; font-size: 10.5px; font-weight: 700; color: #fff; font-family: var(--mono); }
+  @media (max-width: 860px) { .charts { grid-template-columns: 1fr; } }
+  @media (prefers-reduced-motion: reduce) { * { animation: none !important; transition: none !important; } }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header class="top">
+    <div class="mark"><svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="#fff" stroke-width="2"><path d="M4 16l5-6 4 4 7-8"/></svg></div>
+    <h1>Export Monitor</h1>
+    <span class="env" id="env">connecting…</span>
+    <div class="spacer"></div>
+    <span class="small muted" id="conn"><span class="dot"></span> server</span>
+  </header>
+
+  <h2><span class="dot" id="live-dot"></span> Live export</h2>
+  <section class="card" id="live" aria-live="polite"></section>
+
+  <h2>Results</h2>
+  <section class="card">
+    <div class="toolbar">
+      <div class="seg" role="radiogroup" aria-label="Job type">
+        <button type="button" data-kind="all" class="on">All</button>
+        <button type="button" data-kind="export">Timeline export</button>
+        <button type="button" data-kind="convert">Convert</button>
+      </div>
+      <input type="search" id="q" placeholder="Filter: h264, webm, worker…" aria-label="Filter results" />
+      <label class="check"><input type="checkbox" id="auto" /> Include automated (Playwright) runs</label>
+      <div class="spacer"></div>
+      <button type="button" class="btn primary" id="compare" disabled title="Tick 2–4 results to compare">Compare</button>
+      <button type="button" class="btn" id="dl-json">JSON</button>
+      <button type="button" class="btn" id="dl-csv">CSV</button>
+      <button type="button" class="btn danger" id="del" disabled>Delete</button>
+    </div>
+    <div class="table-wrap"><table class="res" id="table"></table></div>
+  </section>
+  <section class="card detail" id="detail" hidden></section>
+</div>
+<div class="tip" id="tip"></div>
+
+<script>
+'use strict'
+const $ = (s, el = document) => el.querySelector(s)
+const css = (v) => getComputedStyle(document.documentElement).getPropertyValue(v).trim()
+const esc = (s) => String(s ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[c])
+const RUN_SLOTS = ['--s1', '--s2', '--s3', '--s4'] // compare: run N keeps slot N (by selection order)
+
+// ---------------------------------------------------------------- formatting
+const fmtMs = (v) => (v == null || !isFinite(v) ? '—' : v >= 10000 ? `${(v / 1000).toFixed(1)} s` : v >= 1000 ? `${(v / 1000).toFixed(2)} s` : `${Math.round(v)} ms`)
+const fmtPct = (v, d = 0) => (v == null || !isFinite(v) ? '—' : `${v.toFixed(d)}%`)
+const fmtX = (v) => (v == null || !isFinite(v) ? '—' : `${v.toFixed(v >= 10 ? 0 : 1)}×`)
+const fmtBytes = (b) => (b == null ? '—' : b < 1048576 ? `${(b / 1024).toFixed(0)} KB` : `${(b / 1048576).toFixed(b < 10485760 ? 2 : 1)} MB`)
+const fmtTime = (ts) => new Date(ts).toLocaleString(undefined, { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit', second: '2-digit' })
+const fmtSec = (ms) => `${(ms / 1000).toFixed(ms < 10000 ? 1 : 0)}s`
+
+let health = null
+
+// ---------------------------------------------------------------- canvas charts (time on x, one y-axis)
+function setupCanvas(cv) {
+  const dpr = window.devicePixelRatio || 1
+  const w = cv.clientWidth
+  const h = cv.clientHeight
+  if (cv.width !== Math.round(w * dpr) || cv.height !== Math.round(h * dpr)) {
+    cv.width = Math.round(w * dpr)
+    cv.height = Math.round(h * dpr)
+  }
+  const ctx = cv.getContext('2d')
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0)
+  ctx.clearRect(0, 0, w, h)
+  return { ctx, w, h }
+}
+
+/** Max for 4 gridlines with round tick values (0, 10, 20, 30, 40 …). */
+function niceMax(v, floor) {
+  const raw = Math.max(v, floor) / 4
+  const p = 10 ** Math.floor(Math.log10(raw))
+  const step = ([1, 2, 2.5, 5, 10].find((s) => s * p >= raw - 1e-9) ?? 10) * p
+  return step * 4
+}
+
+/**
+ * opts: { series: [{ name, color, points: [{t, v}], kind: 'line'|'bar', barWidthMs }], yMax, yFloor, unit, tMax, bands: [{t0,t1,label}] }
+ */
+function drawChart(cv, opts) {
+  const { ctx, w, h } = setupCanvas(cv)
+  const L = 42, R = 10, T = 8, B = 22
+  const pw = w - L - R, ph = h - T - B
+  const all = opts.series.flatMap((s) => s.points.map((p) => p.v)).filter((v) => v != null)
+  const yMax = opts.yMax ?? niceMax(all.length ? Math.max(...all) : 0, opts.yFloor ?? 1)
+  const tMax = Math.max(opts.tMax ?? 0, ...opts.series.flatMap((s) => s.points.map((p) => p.t)), 1000)
+  const x = (t) => L + (t / tMax) * pw
+  const y = (v) => T + ph - (Math.min(v, yMax) / yMax) * ph
+  // grid + y labels (recessive)
+  ctx.font = '10.5px ui-monospace, Menlo, monospace'
+  ctx.fillStyle = css('--text-3')
+  ctx.strokeStyle = css('--grid')
+  ctx.lineWidth = 1
+  ctx.textAlign = 'right'
+  ctx.textBaseline = 'middle'
+  for (let i = 0; i <= 4; i++) {
+    const v = (yMax / 4) * i
+    const yy = Math.round(y(v)) + 0.5
+    ctx.beginPath(); ctx.moveTo(L, yy); ctx.lineTo(w - R, yy); ctx.stroke()
+    ctx.fillText(`${+v.toFixed(v < 10 && v % 1 ? 1 : 0)}${opts.unit ?? ''}`, L - 6, yy)
+  }
+  // x labels (seconds)
+  ctx.textAlign = 'center'
+  ctx.textBaseline = 'top'
+  const stepS = [0.5, 1, 2, 5, 10, 15, 30, 60, 120, 300].find((s) => (s * 1000 / tMax) * pw >= 55) ?? 600
+  for (let s = 0; s * 1000 <= tMax + 1; s += stepS) ctx.fillText(`${s}s`, x(s * 1000), T + ph + 6)
+  // series
+  for (const s of opts.series) {
+    ctx.fillStyle = s.color
+    ctx.strokeStyle = s.color
+    if (s.kind === 'bar') {
+      const bw = Math.max(2, (s.barWidthMs / tMax) * pw - 2) // 2px surface gap between bars
+      for (const p of s.points) {
+        if (!p.v) continue
+        const x0 = x(p.t - s.barWidthMs) + 1
+        const y0 = y(p.v)
+        const hh = T + ph - y0
+        roundTop(ctx, x0, y0, bw, hh, Math.min(4, bw / 2, hh))
+      }
+    } else {
+      const pts = s.points.filter((p) => p.v != null)
+      if (!pts.length) continue
+      ctx.lineWidth = 2
+      ctx.lineJoin = 'round'
+      ctx.beginPath()
+      pts.forEach((p, i) => (i ? ctx.lineTo(x(p.t), y(p.v)) : ctx.moveTo(x(p.t), y(p.v))))
+      ctx.stroke()
+      if (pts.length === 1) { ctx.beginPath(); ctx.arc(x(pts[0].t), y(pts[0].v), 4, 0, Math.PI * 2); ctx.fill() }
+    }
+  }
+  // hover state
+  cv._chart = { opts, x, y, L, R, T, B, pw, ph, tMax, yMax }
+  if (cv._hoverT != null) drawCrosshair(cv)
+}
+
+function roundTop(ctx, x, y, w, h, r) {
+  ctx.beginPath()
+  ctx.moveTo(x, y + h)
+  ctx.lineTo(x, y + r)
+  ctx.quadraticCurveTo(x, y, x + r, y)
+  ctx.lineTo(x + w - r, y)
+  ctx.quadraticCurveTo(x + w, y, x + w, y + r)
+  ctx.lineTo(x + w, y + h)
+  ctx.closePath()
+  ctx.fill()
+}
+
+function nearest(points, t) {
+  let best = null
+  for (const p of points) if (!best || Math.abs(p.t - t) < Math.abs(best.t - t)) best = p
+  return best
+}
+
+function drawCrosshair(cv) {
+  const c = cv._chart
+  if (!c) return
+  const ctx = cv.getContext('2d')
+  const t = cv._hoverT
+  const xx = Math.round(c.x(t)) + 0.5
+  ctx.strokeStyle = 'rgba(255,255,255,0.35)'
+  ctx.lineWidth = 1
+  ctx.beginPath(); ctx.moveTo(xx, c.T); ctx.lineTo(xx, c.T + c.ph); ctx.stroke()
+  for (const s of c.opts.series) {
+    if (s.kind === 'bar') continue
+    const p = nearest(s.points.filter((q) => q.v != null), t)
+    if (!p) continue
+    ctx.fillStyle = s.color
+    ctx.strokeStyle = css('--surface')
+    ctx.lineWidth = 2
+    ctx.beginPath(); ctx.arc(c.x(p.t), c.y(p.v), 4.5, 0, Math.PI * 2); ctx.fill(); ctx.stroke()
+  }
+}
+
+function attachHover(cv, format) {
+  if (cv._hoverBound) return
+  cv._hoverBound = true
+  const tip = $('#tip')
+  cv.addEventListener('pointermove', (e) => {
+    const c = cv._chart
+    if (!c) return
+    const r = cv.getBoundingClientRect()
+    const px = e.clientX - r.left
+    if (px < c.L || px > r.width - c.R) return leave()
+    cv._hoverT = ((px - c.L) / c.pw) * c.tMax
+    drawChart(cv, c.opts)
+    const rows = c.opts.series.map((s) => {
+      const pts = s.points.filter((q) => q.v != null)
+      const p = s.kind === 'bar' ? pts.find((q) => cv._hoverT <= q.t && cv._hoverT > q.t - s.barWidthMs) ?? { v: 0, t: cv._hoverT } : nearest(pts, cv._hoverT)
+      return p ? `<div class="row"><span class="swatch" style="background:${s.color}"></span>${esc(s.name)} <b>${format(p.v, s)}</b></div>` : ''
+    }).join('')
+    tip.innerHTML = `<div class="muted small">t = ${(cv._hoverT / 1000).toFixed(1)} s</div>${rows}`
+    tip.style.display = 'block'
+    const tw = tip.offsetWidth
+    tip.style.left = `${Math.min(window.innerWidth - tw - 8, e.clientX + 14) + window.scrollX}px`
+    tip.style.top = `${e.clientY + window.scrollY - 10}px`
+  })
+  const leave = () => {
+    cv._hoverT = null
+    tip.style.display = 'none'
+    if (cv._chart) drawChart(cv, cv._chart.opts)
+  }
+  cv.addEventListener('pointerleave', leave)
+}
+
+/** Builds the 4 standard charts (CPU, GPU, main thread, memory) into a container from a job's series. */
+function renderSeriesCharts(root, series, tMax) {
+  if (!root._built) {
+    root.innerHTML = `
+      <div class="chart"><div class="chart-head"><span class="chart-title">CPU</span><span class="legend"><span><i class="swatch" style="background:var(--c-cpu)"></i>System</span><span><i class="swatch" style="background:var(--c-chrome)"></i>Chrome (share of all cores)</span></span></div><canvas data-c="cpu"></canvas></div>
+      <div class="chart"><div class="chart-head"><span class="chart-title">GPU utilization</span><span class="legend muted">whole GPU (ioreg)</span></div><canvas data-c="gpu"></canvas></div>
+      <div class="chart"><div class="chart-head"><span class="chart-title">Main-thread blocking</span><span class="legend muted">long-task time per 0.5 s</span></div><canvas data-c="main"></canvas></div>
+      <div class="chart"><div class="chart-head"><span class="chart-title">Chrome memory</span><span class="legend muted">all browser processes (RSS)</span></div><canvas data-c="mem"></canvas></div>`
+    root._built = true
+    root.querySelectorAll('canvas').forEach((cv) =>
+      attachHover(cv, (v, s) => (v == null ? '—' : s.unit === 'GB' ? `${v.toFixed(2)} GB` : s.unit === 'ms' ? `${Math.round(v)} ms` : `${v.toFixed(0)}%`)),
+    )
+  }
+  const S = series?.samples ?? []
+  const M = series?.mainThread ?? []
+  const pt = (key, scale = 1) => S.map((s) => ({ t: s.t, v: s[key] == null ? null : s[key] * scale }))
+  const cv = (k) => root.querySelector(`canvas[data-c="${k}"]`)
+  drawChart(cv('cpu'), { tMax, yMax: 100, unit: '%', series: [{ name: 'System', color: css('--c-cpu'), points: pt('cpu') }, { name: 'Chrome', color: css('--c-chrome'), points: pt('chrome') }] })
+  drawChart(cv('gpu'), { tMax, yMax: 100, unit: '%', series: [{ name: 'GPU', color: css('--c-gpu'), points: pt('gpu') }] })
+  drawChart(cv('main'), { tMax, yFloor: 40, unit: 'ms', series: [{ name: 'Blocked', color: css('--c-main'), kind: 'bar', barWidthMs: 500, unit: 'ms', points: M.map((b) => ({ t: b.t, v: b.blockedMs })) }] })
+  drawChart(cv('mem'), { tMax, yFloor: 1, unit: 'G', series: [{ name: 'RSS', color: css('--c-mem'), unit: 'GB', points: pt('rssMB', 1 / 1024) }] })
+}
+
+// ---------------------------------------------------------------- live monitor
+const live = $('#live')
+let liveJobId = null
+let lastLiveSeen = null
+
+function renderWaiting() {
+  liveJobId = null
+  $('#live-dot').className = 'dot'
+  live.innerHTML = `<div class="waiting">
+    <svg width="30" height="30" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" style="color:var(--text-3)"><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/></svg>
+    <div><div class="big">Waiting for an export…</div>
+    <div class="muted small">Start one in the editor (<b>Export ⌘E</b> or <b>Convert file…</b>). Recording starts and stops automatically; nothing is recorded while you edit.</div></div></div>`
+}
+
+function liveTile(k, v, sub, color) {
+  return `<div class="tile"><div class="k">${color ? `<i class="swatch" style="background:${color}"></i>` : ''}${k}</div><div class="v">${v}</div>${sub ? `<div class="sub">${sub}</div>` : ''}</div>`
+}
+
+function renderLive(mon) {
+  const job = mon.jobs[0]
+  if (!job) {
+    if (liveJobId) {
+      lastLiveSeen = liveJobId
+      void loadRecords(true)
+    }
+    return renderWaiting()
+  }
+  $('#live-dot').className = 'dot live'
+  if (liveJobId !== job.id) {
+    liveJobId = job.id
+    live.innerHTML = `<div class="live-head"></div><div class="progress"><div></div></div><div class="progress-meta"></div><div class="tiles"></div><div class="charts"></div>`
+  }
+  const S = mon.series?.samples ?? []
+  const M = mon.series?.mainThread ?? []
+  const last = S.at(-1) ?? {}
+  const elapsed = job.elapsedMs
+  const eta = job.progress > 0.02 ? (elapsed / job.progress) * (1 - job.progress) : null
+  const blocked = M.reduce((a, b) => a + (b.blockedMs || 0), 0)
+  const tbt = M.reduce((a, b) => a + (b.tbtMs || 0), 0)
+  const longTasks = M.reduce((a, b) => a + (b.longTasks || 0), 0)
+  const maxTask = M.reduce((a, b) => Math.max(a, b.maxTaskMs || 0), 0)
+  const avg = (k) => {
+    const v = S.map((s) => s[k]).filter((x) => x != null)
+    return v.length ? v.reduce((a, b) => a + b, 0) / v.length : null
+  }
+  $('.live-head', live).innerHTML = `<span class="title">${esc(job.label)}</span>
+    <span class="badge kind-${job.kind}">${job.kind === 'convert' ? 'Convert' : 'Timeline export'}</span>
+    <span class="badge">${esc(job.container ?? '')} · ${esc(job.videoCodec ?? 'no video')} / ${esc(job.audioCodec ?? 'no audio')}</span>
+    <span class="badge">${job.runIn === 'main' ? 'main thread' : 'worker'}</span>
+    ${job.source === 'playwright' ? '<span class="badge">automated</span>' : ''}`
+  $('.progress > div', live).style.width = `${Math.round(job.progress * 100)}%`
+  $('.progress-meta', live).innerHTML = `<span class="mono">${Math.round(job.progress * 100)}%</span><span>elapsed <b class="mono">${fmtMs(elapsed)}</b></span><span>left ≈ <b class="mono">${eta == null ? '—' : fmtMs(eta)}</b></span>${job.mediaDuration ? `<span>${job.mediaDuration.toFixed(1)} s of media</span>` : ''}`
+  $('.tiles', live).innerHTML = [
+    liveTile('System CPU', fmtPct(last.cpu), `avg ${fmtPct(avg('cpu'))}`, css('--c-cpu')),
+    liveTile('Chrome CPU', fmtPct(last.chrome), `${last.chromeCores == null ? '' : (last.chromeCores / 100).toFixed(1) + ' cores busy'}`, css('--c-chrome')),
+    liveTile('GPU', fmtPct(last.gpu), `avg ${fmtPct(avg('gpu'))}`, css('--c-gpu')),
+    liveTile('Main-thread blocked', fmtMs(blocked), `${longTasks} long tasks · TBT ${fmtMs(tbt)}`, css('--c-main')),
+    liveTile('Longest task', fmtMs(maxTask), maxTask > 50 ? 'over the 50 ms budget' : 'within 50 ms budget'),
+    liveTile('Chrome memory', last.rssMB ? `${(last.rssMB / 1024).toFixed(2)} GB` : '—', '', css('--c-mem')),
+    ...(last.gpuW != null ? [liveTile('GPU power', `${last.gpuW.toFixed(1)} W`, `CPU ${last.cpuW?.toFixed(1) ?? '—'} W`)] : []),
+  ].join('')
+  renderSeriesCharts($('.charts', live), mon.series, Math.max(10000, elapsed + 1000))
+}
+
+async function pollMonitor() {
+  let delay = 1000
+  try {
+    const r = await fetch('/monitor', { cache: 'no-store' })
+    const mon = await r.json()
+    setConn(true)
+    renderLive(mon)
+    if (mon.jobs.length) delay = 500
+  } catch {
+    setConn(false)
+  }
+  setTimeout(pollMonitor, delay)
+}
+
+function setConn(ok) {
+  $('#conn').innerHTML = ok ? '<span class="dot live"></span> server connected' : '<span class="dot"></span> <span class="bad">server unreachable</span> (npm run bench:server)'
+}
+
+// ---------------------------------------------------------------- results
+let records = []
+let kindFilter = 'all'
+let selected = [] // ids in selection order (compare colors follow this order)
+let openId = null
+let sort = { key: 'savedAt', dir: -1 }
+
+const COLS = [
+  { key: 'sel', label: '', sortable: false },
+  { key: 'savedAt', label: 'When', get: (r) => r.meta.startedAt, fmt: (v) => fmtTime(v) },
+  { key: 'kind', label: 'Type', get: (r) => r.meta.kind, fmt: (v) => `<span class="badge kind-${v}">${v === 'convert' ? 'Convert' : 'Export'}</span>` },
+  { key: 'job', label: 'Job', get: (r) => r.report.label, fmt: (v) => esc(v), cls: 'job' },
+  { key: 'out', label: 'Output', get: (r) => `${r.report.settings.container} · ${r.report.settings.videoCodec ?? '—'}/${r.report.settings.audioCodec ?? '—'}`, fmt: esc },
+  { key: 'runIn', label: 'Run in', get: (r) => r.report.runIn, fmt: (v) => (v === 'main' ? 'main' : 'worker') },
+  { key: 'conv', label: 'Conversion', num: true, get: (r) => r.report.derived?.conversionMs, fmt: fmtMs },
+  { key: 'enc', label: 'Encode', num: true, get: (r) => r.report.derived?.encodeMs, fmt: (v) => (v == null ? '<span class="muted">pipelined</span>' : fmtMs(v)) },
+  { key: 'speed', label: 'Speed', num: true, get: (r) => r.report.derived?.realtimeFactor, fmt: fmtX },
+  { key: 'tbt', label: 'Main TBT', num: true, get: (r) => r.report.mainThread?.tbtMs, fmt: fmtMs },
+  { key: 'longest', label: 'Longest task', num: true, get: (r) => r.report.mainThread?.longestTaskMs, fmt: fmtMs },
+  { key: 'cpu', label: 'CPU avg', num: true, get: (r) => r.report.system?.cpuSystemPct?.avg, fmt: (v) => fmtPct(v) },
+  { key: 'gpu', label: 'GPU avg', num: true, get: (r) => r.report.system?.gpuDevicePct?.avg, fmt: (v) => fmtPct(v) },
+  { key: 'size', label: 'Size', num: true, get: (r) => r.report.output?.bytes, fmt: fmtBytes },
+  { key: 'ok', label: 'OK', get: (r) => (r.report.status !== 'done' ? -1 : r.report.verify?.ok ? 1 : 0), fmt: (v) => (v === 1 ? '<span class="ok" title="Output re-opened and decoded">✓ ok</span>' : v === 0 ? '<span class="bad" title="Verification found a problem">⚠ check</span>' : '<span class="bad">✗ failed</span>') },
+]
+
+function visibleRecords() {
+  const q = $('#q').value.trim().toLowerCase()
+  const auto = $('#auto').checked
+  return records
+    .filter((r) => (auto || r.source !== 'playwright') && (kindFilter === 'all' || r.meta.kind === kindFilter))
+    .filter((r) => !q || JSON.stringify([r.report.label, r.report.settings, r.report.runIn, r.meta.kind]).toLowerCase().includes(q))
+    .sort((a, b) => {
+      const c = COLS.find((x) => x.key === sort.key)
+      const va = c?.get ? c.get(a) : a.savedAt
+      const vb = c?.get ? c.get(b) : b.savedAt
+      if (va == null) return 1
+      if (vb == null) return -1
+      return (va > vb ? 1 : va < vb ? -1 : 0) * sort.dir
+    })
+}
+
+function renderTable() {
+  const rows = visibleRecords()
+  const t = $('#table')
+  if (!records.length) {
+    t.innerHTML = `<tbody><tr><td class="empty">No exports recorded yet. Export or convert something in the editor and it will appear here.</td></tr></tbody>`
+  } else if (!rows.length) {
+    t.innerHTML = `<tbody><tr><td class="empty">No results match the filter.</td></tr></tbody>`
+  } else {
+    t.innerHTML = `<thead><tr>${COLS.map((c) => `<th class="${c.num ? 'num' : ''}" data-k="${c.key}" ${sort.key === c.key ? `aria-sort="${sort.dir > 0 ? 'ascending' : 'descending'}"` : ''}>${c.label}</th>`).join('')}</tr></thead>
+    <tbody>${rows
+      .map((r) => {
+        const si = selected.indexOf(r.id)
+        return `<tr data-id="${r.id}" class="${r.id === openId ? 'sel' : ''}">${COLS.map((c) =>
+          c.key === 'sel'
+            ? `<td><label style="display:inline-flex;gap:6px;align-items:center" onclick="event.stopPropagation()"><input type="checkbox" data-pick="${r.id}" ${si >= 0 ? 'checked' : ''} aria-label="Select for compare" />${si >= 0 && si < 4 ? `<span class="num-chip" style="background:var(${RUN_SLOTS[si]})">${si + 1}</span>` : ''}</label></td>`
+            : `<td class="${c.num ? 'num' : ''} ${c.cls ?? ''}">${c.fmt(c.get(r))}</td>`,
+        ).join('')}</tr>`
+      })
+      .join('')}</tbody>`
+  }
+  $('#compare').disabled = selected.length < 2 || selected.length > 4
+  $('#compare').textContent = selected.length >= 2 ? `Compare ${selected.length}` : 'Compare'
+  $('#compare').title = selected.length > 4 ? 'Compare up to 4 results at a time' : 'Tick 2–4 results to compare'
+  $('#del').disabled = !selected.length && !openId
+}
+
+async function loadRecords(selectNewest = false) {
+  try {
+    records = await (await fetch('/records', { cache: 'no-store' })).json()
+  } catch {
+    return
+  }
+  renderTable()
+  if (selectNewest && lastLiveSeen) {
+    const newest = records.find((r) => r.id.endsWith(`-${lastLiveSeen}`))
+    if (newest) openDetail(newest.id)
+  }
+}
+
+// ---------------------------------------------------------------- detail
+const STAGES = [
+  ['workerSpawn', 'Worker start'],
+  ['setup', 'Setup'],
+  ['decodeWait', 'Decode wait'],
+  ['composite', 'Composite'],
+  ['videoEncodeWait', 'Video encode'],
+  ['audioDecodeMix', 'Audio decode+mix'],
+  ['audioEncodeWait', 'Audio encode'],
+  ['finalize', 'Finalize / mux'],
+]
+
+async function openDetail(id) {
+  openId = id
+  renderTable()
+  const el = $('#detail')
+  el.hidden = false
+  el.innerHTML = '<div class="pad muted">Loading…</div>'
+  const rec = await (await fetch(`/records/${encodeURIComponent(id)}`)).json()
+  const r = rec.report
+  const t = r.timings ?? {}
+  const sys = r.system ?? {}
+  const mt = r.mainThread ?? {}
+  const enc = r.encoder ?? {}
+  // Stage groups in a fixed order with fixed slots (1–4): any subset keeps passing neighbour pairs.
+  const g = (keys) => keys.reduce((a, k) => a + (t[k] ?? 0), 0)
+  const sub = (keys) => keys.filter((k) => (t[k] ?? 0) > 0).map((k) => `${STAGES.find(([x]) => x === k)[1].toLowerCase()} ${fmtMs(t[k])}`).join(' + ')
+  const pipelined = r.engine === 'conversion' && t.total ? Math.max(0, t.total - (t.setup ?? 0)) : 0
+  const stageItems = [
+    ['Setup', g(['workerSpawn', 'setup']), sub(['workerSpawn', 'setup']), '--s1'],
+    pipelined
+      ? ['Decode + encode + mux (pipelined)', pipelined, 'inside Mediabunny Conversion', '--s2']
+      : ['Decode + composite', g(['decodeWait', 'composite']), sub(['decodeWait', 'composite']), '--s2'],
+    ['Encode + flush/mux', g(['videoEncodeWait', 'audioEncodeWait', 'finalize']), sub(['videoEncodeWait', 'audioEncodeWait', 'finalize']), '--s3'],
+    ['Audio decode + mix', g(['audioDecodeMix']), '', '--s4'],
+  ].filter(([, v]) => v > 0)
+  const total = stageItems.reduce((a, [, v]) => a + v, 0)
+  const kv = (k, v) => `<div><dt>${k}</dt><dd title="${String(v).replace(/<[^>]+>/g, '').replace(/"/g, '&quot;')}">${v}</dd></div>`
+  const yn = (v) => (v == null ? 'n/a' : v ? 'yes' : 'no (re-encoded)')
+  const dur = (rec.meta.endedAt ?? 0) - rec.meta.startedAt
+  el.innerHTML = `
+    <div class="detail-head">
+      <span class="title">${esc(r.label)}</span>
+      <span class="badge kind-${rec.meta.kind}">${rec.meta.kind === 'convert' ? 'Convert' : 'Timeline export'}</span>
+      <span class="badge">${r.engine}</span><span class="badge">${r.runIn}</span>
+      <span class="muted small">${fmtTime(rec.meta.startedAt)}</span>
+      <div class="spacer"></div>
+      <button type="button" class="btn" id="close-detail">Close</button>
+    </div>
+    ${r.status !== 'done' ? `<div class="pad bad">✗ ${esc(r.status)}: ${esc(r.error)}</div>` : ''}
+    <div class="tiles">
+      ${liveTile('Conversion time', fmtMs(r.derived?.conversionMs), `wall ${fmtMs(r.derived?.wallMs)}`)}
+      ${liveTile('Encode time', r.derived?.encodeMs == null ? 'pipelined' : fmtMs(r.derived.encodeMs), r.derived?.encodeMs == null ? 'Conversion API: not separable' : 'submit/backpressure + flush')}
+      ${liveTile('Speed', fmtX(r.derived?.realtimeFactor), `${r.frames} frames · ${r.derived?.encodeFps ? r.derived.encodeFps.toFixed(0) + ' fps' : '—'}`)}
+      ${liveTile('Encoder latency', fmtMs(enc.latencyAvg), enc.latencyP95 != null ? `p95 ${fmtMs(enc.latencyP95)}` : r.engine === 'conversion' ? 'not exposed by Conversion API' : '')}
+      ${liveTile('Main TBT', fmtMs(mt.tbtMs), `${mt.longTasks ?? 0} long tasks · longest ${fmtMs(mt.longestTaskMs)}`, css('--c-main'))}
+      ${liveTile('CPU avg', fmtPct(sys.cpuSystemPct?.avg), `max ${fmtPct(sys.cpuSystemPct?.max)}`, css('--c-cpu'))}
+      ${liveTile('GPU avg', fmtPct(sys.gpuDevicePct?.avg), `max ${fmtPct(sys.gpuDevicePct?.max)}`, css('--c-gpu'))}
+      ${liveTile('Output', fmtBytes(r.output?.bytes), r.output?.bitrateKbps ? `${Math.round(r.output.bitrateKbps)} kb/s` : '')}
+    </div>
+    ${total > 0 ? `<div class="stages"><div class="small muted">Where the time went (${fmtMs(total)} measured stages)</div>
+      <div class="stackbar" role="img" aria-label="Stage breakdown">${stageItems.map(([name, v, , c]) => `<div style="flex:${v};background:var(${c})" title="${name}: ${fmtMs(v)}"></div>`).join('')}</div>
+      <div class="stage-legend">${stageItems.map(([name, v, detail, c]) => `<span title="${esc(detail)}"><i class="swatch" style="background:var(${c})"></i>${name} <b class="mono">${fmtMs(v)}</b>${detail && detail.includes('+') ? ` <span class="muted">(${esc(detail)})</span>` : ''}</span>`).join('')}</div></div>` : ''}
+    <div class="charts" id="detail-charts"></div>
+    <dl class="kv">
+      ${kv('Input', esc(r.input?.name))}
+      ${kv('Output file', esc(r.output?.fileName))}
+      ${kv('Container / codecs', `${esc(r.settings.container)} · ${esc(r.settings.videoCodec ?? '—')} / ${esc(r.settings.audioCodec ?? '—')}`)}
+      ${kv('Resolution / fps', `${r.settings.width}×${r.settings.height} @ ${r.settings.fps}`)}
+      ${kv('Quality', r.settings.qualityMode === 'level' ? r.settings.quality : `${(r.settings.videoBitrate / 1e6).toFixed(1)} Mb/s`)}
+      ${kv('Hardware preference', esc(r.settings.hardwareAcceleration))}
+      ${kv('Encoder', esc(enc.videoEncoderConfig?.codec ?? enc.audioEncoderConfig?.codec ?? '—'))}
+      ${r.conversion ? kv('Stream copy (predicted)', `video ${yn(r.conversion.copyExpected.video)} · audio ${yn(r.conversion.copyExpected.audio)}`) : ''}
+      ${kv('Encoder busy span', fmtMs(enc.encoderSpan))}
+      ${kv('Encoder latency max', fmtMs(enc.latencyMax))}
+      ${kv('Main thread blocked', `${fmtPct(mt.blockedPct, 1)} of job`)}
+      ${kv('Frame gaps > 50 ms', mt.rafGapsOver50ms ?? '—')}
+      ${kv('Chrome CPU avg', sys.browserCpuPct ? `${(sys.browserCpuPct.avg / 100).toFixed(1)} cores` : '—')}
+      ${Object.entries(sys.browserCpuByType ?? {}).map(([k, s]) => kv(`  ${k}`, `${(s.avg / 100).toFixed(2)} cores avg`)).join('')}
+      ${kv('Chrome memory max', sys.browserRssMB ? `${(sys.browserRssMB.max / 1024).toFixed(2)} GB` : '—')}
+      ${sys.gpuPowerW ? kv('GPU / CPU power', `${sys.gpuPowerW.avg.toFixed(2)} W / ${sys.cpuPowerW?.avg.toFixed(2)} W`) : ''}
+      ${kv('Verification', r.verify ? (r.verify.ok ? `✓ ${esc(r.verify.container)} ${esc(r.verify.videoCodec ?? '')}/${esc(r.verify.audioCodec ?? '')} ${r.verify.duration?.toFixed(2)} s` : `⚠ ${esc(r.verify.problems.join('; '))}`) : '—')}
+      ${kv('Recorded samples', `${rec.series.samples.length} CPU/GPU · ${rec.series.mainThread.length} main-thread`)}
+    </dl>`
+  $('#close-detail').onclick = () => {
+    openId = null
+    el.hidden = true
+    renderTable()
+  }
+  renderSeriesCharts($('#detail-charts'), rec.series, Math.max(dur, 1000))
+  el.scrollIntoView({ behavior: 'smooth', block: 'start' })
+}
+
+// ---------------------------------------------------------------- compare
+async function openCompare() {
+  const ids = selected.slice(0, 4)
+  const recs = await Promise.all(ids.map((id) => fetch(`/records/${encodeURIComponent(id)}`).then((r) => r.json())))
+  openId = null
+  renderTable()
+  const el = $('#detail')
+  el.hidden = false
+  const metrics = [
+    ['Conversion time', 'lower is better', (r) => r.report.derived?.conversionMs, fmtMs],
+    ['Encode time', 'lower is better', (r) => r.report.derived?.encodeMs, fmtMs],
+    ['Speed (× real time)', 'higher is better', (r) => r.report.derived?.realtimeFactor, fmtX],
+    ['Main-thread TBT', 'lower is better', (r) => r.report.mainThread?.tbtMs, fmtMs],
+    ['Main-thread blocked total', 'lower is better', (r) => r.series.mainThread.reduce((a, b) => a + (b.blockedMs || 0), 0), fmtMs],
+    ['CPU avg', 'system', (r) => r.report.system?.cpuSystemPct?.avg, (v) => fmtPct(v)],
+    ['Chrome CPU avg', 'cores busy', (r) => (r.report.system?.browserCpuPct?.avg ?? null) / 100 || null, (v) => (v == null ? '—' : `${v.toFixed(2)} c`)],
+    ['GPU avg', 'whole GPU', (r) => r.report.system?.gpuDevicePct?.avg, (v) => fmtPct(v)],
+    ['Encoder latency avg', 'per frame', (r) => r.report.encoder?.latencyAvg, fmtMs],
+    ['Output size', '', (r) => r.report.output?.bytes, fmtBytes],
+  ]
+  const color = (i) => `var(${RUN_SLOTS[i]})`
+  el.innerHTML = `
+    <div class="detail-head"><span class="title">Compare ${recs.length} results</span><div class="spacer"></div><button type="button" class="btn" id="close-detail">Close</button></div>
+    <div class="run-key" style="padding-top:10px">${recs.map((r, i) => `<span><span class="num-chip" style="background:${color(i)}">${i + 1}</span>${esc(r.report.label)} <span class="muted">(${r.report.runIn})</span></span>`).join('')}</div>
+    <div class="compare-grid">${metrics
+      .map(([name, hint, get, fmt]) => {
+        const vals = recs.map(get)
+        const max = Math.max(...vals.filter((v) => v != null && isFinite(v)), 1e-9)
+        return `<div class="metric"><div class="name">${name}<small>${hint}</small></div>${vals
+          .map((v, i) => `<div class="hbar" title="${esc(recs[i].report.label)}: ${fmt(v)}"><span class="num-chip" style="background:${color(i)}">${i + 1}</span><div class="track"><div class="fill" style="width:${v == null ? 0 : (v / max) * 100}%;background:${color(i)}"></div></div><span class="val">${fmt(v)}</span></div>`)
+          .join('')}</div>`
+      })
+      .join('')}</div>
+    <div class="charts" id="cmp-charts">
+      <div class="chart"><div class="chart-head"><span class="chart-title">GPU over time</span><span class="legend">${recs.map((r, i) => `<span><i class="swatch" style="background:${color(i)}"></i>${i + 1}</span>`).join('')}</span></div><canvas data-c="gpu"></canvas></div>
+      <div class="chart"><div class="chart-head"><span class="chart-title">System CPU over time</span><span class="legend">${recs.map((r, i) => `<span><i class="swatch" style="background:${color(i)}"></i>${i + 1}</span>`).join('')}</span></div><canvas data-c="cpu"></canvas></div>
+    </div>`
+  $('#close-detail').onclick = () => (el.hidden = true)
+  const tMax = Math.max(...recs.map((r) => (r.meta.endedAt ?? 0) - r.meta.startedAt), 1000)
+  for (const key of ['gpu', 'cpu']) {
+    const cv = $(`#cmp-charts canvas[data-c="${key}"]`)
+    attachHover(cv, (v) => (v == null ? '—' : `${v.toFixed(0)}%`))
+    drawChart(cv, { tMax, yMax: 100, unit: '%', series: recs.map((r, i) => ({ name: `${i + 1}`, color: css(RUN_SLOTS[i]), points: r.series.samples.map((s) => ({ t: s.t, v: s[key] })) })) })
+  }
+  el.scrollIntoView({ behavior: 'smooth', block: 'start' })
+}
+
+// ---------------------------------------------------------------- downloads
+function download(text, name, type) {
+  const url = URL.createObjectURL(new Blob([text], { type }))
+  const a = document.createElement('a')
+  a.href = url
+  a.download = name
+  a.click()
+  setTimeout(() => URL.revokeObjectURL(url), 4000)
+}
+function flat(r) {
+  const p = r.report
+  return {
+    id: r.id, started: new Date(r.meta.startedAt).toISOString(), source: r.source, type: r.meta.kind, job: p.label, status: p.status,
+    engine: p.engine, runIn: p.runIn, container: p.settings.container, videoCodec: p.settings.videoCodec, audioCodec: p.settings.audioCodec,
+    width: p.settings.width, height: p.settings.height, fps: p.settings.fps, hw: p.settings.hardwareAcceleration,
+    conversionMs: p.derived?.conversionMs, encodeMs: p.derived?.encodeMs, realtimeX: p.derived?.realtimeFactor, encodeFps: p.derived?.encodeFps,
+    ...Object.fromEntries(STAGES.map(([k]) => [`${k}Ms`, p.timings?.[k]])),
+    encLatencyAvgMs: p.encoder?.latencyAvg, encLatencyP95Ms: p.encoder?.latencyP95,
+    mtLongTasks: p.mainThread?.longTasks, mtTbtMs: p.mainThread?.tbtMs, mtLongestMs: p.mainThread?.longestTaskMs, mtBlockedPct: p.mainThread?.blockedPct,
+    cpuAvg: p.system?.cpuSystemPct?.avg, cpuMax: p.system?.cpuSystemPct?.max, chromeCoresAvg: p.system?.browserCpuPct ? p.system.browserCpuPct.avg / 100 : null,
+    gpuAvg: p.system?.gpuDevicePct?.avg, gpuMax: p.system?.gpuDevicePct?.max, gpuPowerW: p.system?.gpuPowerW?.avg, chromeRssMaxMB: p.system?.browserRssMB?.max,
+    outBytes: p.output?.bytes, outKbps: p.output?.bitrateKbps, verified: p.verify?.ok, problems: p.verify?.problems?.join(' | '), error: p.error,
+  }
+}
+function toCSV(rows) {
+  const cols = [...new Set(rows.flatMap(Object.keys))]
+  const e = (v) => (v == null ? '' : typeof v === 'number' ? +v.toFixed(3) : /[",\n]/.test(String(v)) ? `"${String(v).replace(/"/g, '""')}"` : v)
+  return [cols.join(','), ...rows.map((r) => cols.map((c) => e(r[c])).join(','))].join('\n')
+}
+const stamp = () => new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19)
+
+// ---------------------------------------------------------------- events
+document.querySelectorAll('[data-kind]').forEach((b) =>
+  b.addEventListener('click', () => {
+    kindFilter = b.dataset.kind
+    document.querySelectorAll('[data-kind]').forEach((x) => x.classList.toggle('on', x === b))
+    renderTable()
+  }),
+)
+$('#q').addEventListener('input', renderTable)
+$('#auto').addEventListener('change', renderTable)
+$('#table').addEventListener('click', (e) => {
+  const th = e.target.closest('th[data-k]')
+  if (th && th.dataset.k !== 'sel') {
+    sort = { key: th.dataset.k, dir: sort.key === th.dataset.k ? -sort.dir : -1 }
+    return renderTable()
+  }
+  const tr = e.target.closest('tr[data-id]')
+  if (tr) openDetail(tr.dataset.id)
+})
+$('#table').addEventListener('change', (e) => {
+  const id = e.target.dataset?.pick
+  if (!id) return
+  selected = e.target.checked ? [...selected, id] : selected.filter((x) => x !== id)
+  renderTable()
+})
+$('#compare').addEventListener('click', openCompare)
+$('#dl-json').addEventListener('click', async () => {
+  const ids = (selected.length ? selected : visibleRecords().map((r) => r.id))
+  const full = await Promise.all(ids.map((id) => fetch(`/records/${encodeURIComponent(id)}`).then((r) => r.json())))
+  download(JSON.stringify(full, null, 2), `exports-${stamp()}.json`, 'application/json')
+})
+$('#dl-csv').addEventListener('click', () => {
+  const rows = (selected.length ? records.filter((r) => selected.includes(r.id)) : visibleRecords()).map(flat)
+  download(toCSV(rows), `exports-${stamp()}.csv`, 'text/csv')
+})
+$('#del').addEventListener('click', async () => {
+  const ids = selected.length ? selected : openId ? [openId] : []
+  if (!ids.length || !confirm(`Delete ${ids.length} result${ids.length > 1 ? 's' : ''}? This can't be undone.`)) return
+  await Promise.all(ids.map((id) => fetch(`/records/${encodeURIComponent(id)}`, { method: 'DELETE' })))
+  selected = []
+  if (ids.includes(openId)) {
+    openId = null
+    $('#detail').hidden = true
+  }
+  loadRecords()
+})
+window.addEventListener('resize', () => {
+  document.querySelectorAll('canvas').forEach((cv) => cv._chart && drawChart(cv, cv._chart.opts))
+})
+
+// ---------------------------------------------------------------- boot
+;(async () => {
+  try {
+    health = await (await fetch('/health')).json()
+    $('#env').textContent = `${health.cpuModel} · ${health.cores} cores · ${health.totalMemGB.toFixed(0)} GB · GPU via ${health.gpuSource ?? 'n/a'}${health.powermetrics ? ' · power via powermetrics' : ''}`
+  } catch {
+    /* shown by setConn */
+  }
+  renderWaiting()
+  await loadRecords()
+  pollMonitor()
+  setInterval(() => !liveJobId && loadRecords(), 10000)
+})()
+</script>
+</body>
+</html>
