@@ -26,6 +26,8 @@ const test = argv.includes('--test')
 const files = argv.includes('--files') ? argv.slice(argv.indexOf('--files') + 1).filter((x) => !x.startsWith('--')).map((f) => path.resolve(f)) : []
 const doExport = argv.includes('--export')
 const log = (...a) => console.log('[showcase]', ...a)
+// how many videos the edit uses (1–4): --count N, else the number of --files videos, else 3
+const want = arg('--count') ? Math.max(1, Math.min(4, Number(arg('--count')) || 3)) : null
 
 // sound-effect kit (bench/sfx/sfx-*.wav, synthesized by bench/make-sfx.mjs); --no-sfx skips it
 const sfxDir = path.join(root, 'bench', 'sfx')
@@ -96,26 +98,27 @@ try {
     await page.locator('input[type=file]').first().setInputFiles([...files, ...sfxFiles])
   } else {
     if (sfxFiles.length) await page.locator('input[type=file]').first().setInputFiles(sfxFiles)
-    log('Chrome is open — import 3 videos (drag them onto the Media panel, or click Import).')
+    log(`Chrome is open — import ${want ?? 3} videos (drag them onto the Media panel, or click Import).`)
   }
 
-  // wait until 3 decodable videos are in the bin
+  // wait until the videos are decodable in the bin
+  const need = want ?? (files.length ? Math.min(4, files.length) : 3)
   let vids = []
   for (let last = -1; ; ) {
     vids = await page.evaluate(() => window.__nleBench.assets().filter((a) => a.info.kind === 'video' && a.info.video?.canDecode))
     if (vids.length !== last) {
       last = vids.length
-      log(`videos imported: ${vids.length}/3${vids.length ? ' — ' + vids.map((v) => v.name).join(', ') : ''}`)
+      log(`videos imported: ${vids.length}/${need}${vids.length ? ' — ' + vids.map((v) => v.name).join(', ') : ''}`)
     }
     const nSfx = await page.evaluate(() => window.__nleBench.assets().filter((a) => /^sfx-/.test(a.name)).length)
-    if (vids.length >= 3 && nSfx >= sfxFiles.length) break
+    if (vids.length >= need && nSfx >= sfxFiles.length) break
     await page.waitForTimeout(1000)
   }
   await page.waitForTimeout(800) // let thumbnails finish
 
-  const ids = vids.slice(0, 3).map((v) => v.id)
+  const ids = vids.slice(0, need).map((v) => v.id)
   const total = await page.evaluate((ids) => window.__nleBench.buildShowcase(ids), ids)
-  log(`built a ${total.toFixed(1)} s edit from: ${vids.slice(0, 3).map((v) => v.name).join(', ')}${sfxFiles.length ? ` + ${sfxFiles.length} sound effects` : ''}`)
+  log(`built a ${total.toFixed(1)} s edit from: ${vids.slice(0, need).map((v) => v.name).join(', ')}${sfxFiles.length ? ` + ${sfxFiles.length} sound effects` : ''}`)
 
   // snapshot a few moments for reference
   for (const [i, t] of [0.9, total * 0.18, total * 0.33, total * 0.5, total * 0.66, total * 0.82, total - 0.6].entries()) {

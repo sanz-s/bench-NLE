@@ -186,7 +186,7 @@ const api = {
   },
 
   /**
-   * Showcase edit from (up to) three imported videos: 8 cuts alternating the sources on V1, each with its own
+   * Showcase edit from (up to) four imported videos: 8 cuts alternating the sources on V1, each with its own
    * effect stack and a different transition on every cut, PiP + stickers on V2, animated titles on V3,
    * adjustment layers on V4, and the linked audio on A1. Returns the edit duration.
    */
@@ -194,9 +194,10 @@ const api = {
     const st = getState()
     const vids = (ids?.length ? ids.map((id) => st.project.assets.find((a) => a.id === id)) : st.project.assets.filter((a) => a.info.kind === 'video'))
       .filter((a) => !!a && a.info.kind === 'video')
-      .slice(0, 3)
+      .slice(0, 4)
     if (!vids.length) throw new Error('import at least one video first')
-    const src = [vids[0], vids[1] ?? vids[0], vids[2] ?? vids[1] ?? vids[0]]
+    const src = vids
+    const nSrc = src.length
     // project size from the first video (long edge ≤ 1920, even dimensions)
     const v0 = src[0].info.video
     const k = v0 ? Math.min(1, 1920 / Math.max(v0.width, v0.height)) : 1
@@ -216,7 +217,7 @@ const api = {
       return e
     }
 
-    // ---- V1: 8 segments, A B C A B C A B — each source used 3/3/2 times, spread through the file
+    // ---- V1: 8 segments cycling through the sources (A B C D A B C D with four), each use spread through the file
     const plan = [
       { s: 0, effects: [fx('ken-burns', { from: 100, to: 130 }), fx('color-grade')], cut: 'cross-zoom' },
       { s: 1, effects: [fx('film-grain', { amount: 30 }), fx('vignette')], filter: defaultFilter('vivid'), cut: 'whip-pan' },
@@ -227,8 +228,9 @@ const api = {
       { s: 0, effects: [fx('duotone'), fx('elastic-scale')], cut: 'film-burn' },
       { s: 1, effects: [fx('depth-of-field'), fx('soft-glow'), fx('cinematic-bars')], filter: defaultFilter('cinematic') },
     ]
-    const uses = [0, 0, 0]
-    const count = plan.reduce((n, x) => (n[x.s]++, n), [0, 0, 0])
+    plan.forEach((seg, i) => (seg.s = i % nSrc))
+    const uses = src.map(() => 0)
+    const count = plan.reduce((n, x) => (n[x.s]++, n), src.map(() => 0))
     let t = 0
     const v1 = []
     plan.forEach((seg, i) => {
@@ -274,7 +276,7 @@ const api = {
     const len = (i) => v1[Math.min(i, v1.length - 1)].duration
 
     // ---- V2: picture-in-picture + stickers (never overlapping on the track)
-    const pipSrc = src[2]
+    const pipSrc = src[2 % nSrc] // a different source than the segment it floats over
     const pipLen = Math.min(len(1) - 0.2, pipSrc.info.duration)
     clips.push(
       makeClip('video', V2.id, at(1) + 0.1, pipLen, {
