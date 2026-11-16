@@ -11,8 +11,8 @@ A browser-based non-linear video editor (NLE) whose purpose is **benchmarking Me
 - Heavy media jobs run in a Web Worker by default. A main-thread mode also exists, but only so the two can be compared in benchmarks.
 
 ## Commands
-- `npm run dev`: Vite dev server on :5173. It sends COOP/COEP headers, and a small middleware (`benchApiBridge` in `vite.config.ts`) bridges `/bench-api` to :5199. The bridge returns 503 quietly when the bench-server is down.
-- `npm run build`: typecheck (`tsc -b`) + production build. `npm run typecheck` runs the typecheck only.
+- `npm run dev`: Vite dev server on :5173. It sends COOP/COEP headers, and a small middleware (`benchApiBridge` in `vite.config.js`) bridges `/bench-api` to :5199. The bridge returns 503 quietly when the bench-server is down.
+- `npm run build`: production build (`vite build`). The code is plain JavaScript (ES modules + JSX), so there is no typecheck step; `npm run lint` and the Playwright tests are the safety net.
 - `npm run lint`: oxlint.
 - `npm run preview`: serves `dist/` with the same headers and proxy.
 - **Export Monitor dashboard:** `bench-server/dashboard.html`, a single self-contained page served at http://127.0.0.1:5199/.
@@ -29,73 +29,73 @@ A browser-based non-linear video editor (NLE) whose purpose is **benchmarking Me
   - `--headless` / `--chromium` choose a different browser setup.
 - `npm run bench:matrix`: round-trips every encodable container × codec (convert, then re-probe).
 - `npm run test:ui`: UI smoke tests through the real UI. `bench/ui-smoke.mjs` covers editing; `bench/effects-smoke.mjs` covers text, stickers, filters, transitions, copy/paste and effects exports. Screenshots go to `bench-results/ui-smoke/` and `bench-results/effects-smoke/`.
-- `node bench/showcase.mjs [--files a b c] [--export] [--no-sfx] [--test]`: opens headed Chrome on the running dev server (or starts one), imports 3 videos (or waits for you to), builds the all-tools showcase edit (`buildShowcase` in `harness.ts`) and leaves the window open. It also imports the synthesized SFX kit from `bench/sfx/` (`node bench/make-sfx.mjs` regenerates it); any asset named `sfx-<name>.wav` is placed on A2+. Export only with `--export`.
+- `node bench/showcase.mjs [--files a b c] [--export] [--no-sfx] [--test]`: opens headed Chrome on the running dev server (or starts one), imports 3 videos (or waits for you to), builds the all-tools showcase edit (`buildShowcase` in `harness.js`) and leaves the window open. It also imports the synthesized SFX kit from `bench/sfx/` (`node bench/make-sfx.mjs` regenerates it); any asset named `sfx-<name>.wav` is placed on A2+. Export only with `--export`.
 - `npx playwright install chromium` is needed only for `--chromium`. The default uses the installed Chrome.
 
 ## Architecture (data flow)
 - `src/media/`: the Mediabunny-only layer, with no React. It runs in both the main thread and the worker.
-  - `extensions.ts` `registerAllExtensions()` must run once **in every JS context** (main thread and each worker) before any decode or encode.
-  - `formats.ts` maps container ids to Mediabunny `*OutputFormat` classes.
-  - `capabilities.ts` builds the format matrix (container → encodable codecs + reasons) that drives the export and convert UI.
-  - `probe.ts` turns a File into `MediaInfo`.
-  - `compositor.ts` draws one timeline instant on a 2D canvas. Preview and export share it.
-  - `videoReader.ts` reads frames sequentially through `CanvasSink`, with seek reset.
-  - `audioMix.ts` decodes, resamples and mixes audio with gain and fades.
-  - `jobs.ts` runs every job: a timeline export (`Output` + `CanvasSource` + `AudioSampleSource`), a single-file `Conversion`, or a "manual pipeline" conversion. It returns stage timings.
-- `src/workers/media.worker.ts` is a thin wrapper around `runJob()` from `jobs.ts`.
+  - `extensions.js` `registerAllExtensions()` must run once **in every JS context** (main thread and each worker) before any decode or encode.
+  - `formats.js` maps container ids to Mediabunny `*OutputFormat` classes.
+  - `capabilities.js` builds the format matrix (container → encodable codecs + reasons) that drives the export and convert UI.
+  - `probe.js` turns a File into `MediaInfo`.
+  - `compositor.js` draws one timeline instant on a 2D canvas. Preview and export share it.
+  - `videoReader.js` reads frames sequentially through `CanvasSink`, with seek reset.
+  - `audioMix.js` decodes, resamples and mixes audio with gain and fades.
+  - `jobs.js` runs every job: a timeline export (`Output` + `CanvasSource` + `AudioSampleSource`), a single-file `Conversion`, or a "manual pipeline" conversion. It returns stage timings.
+- `src/workers/media.worker.js` is a thin wrapper around `runJob()` from `jobs.js`.
 - `src/editor/` is the React UI.
-  - `store.ts` holds the project, undo/redo (snapshot stack plus gesture batching) and IndexedDB autosave. File objects survive structured clone.
-  - `playback.ts` drives the preview: an AudioContext-clocked rAF loop and audio scheduling.
+  - `store.js` holds the project, undo/redo (snapshot stack plus gesture batching) and IndexedDB autosave. File objects survive structured clone.
+  - `playback.js` drives the preview: an AudioContext-clocked rAF loop and audio scheduling.
   - The UI components are in `components/`.
 - `src/bench/`:
-  - `metrics.ts` defines the `JobReport` type and CSV.
-  - `mainThread.ts` tracks Long Tasks / TBT and rAF frame gaps.
-  - `serverClient.ts` talks to the optional `/bench-api`.
-  - `jobRunner.ts` orchestrates: server session → worker or main → output verification → report.
-  - `harness.ts` exposes `window.__nleBench` for Playwright.
+  - `metrics.js` builds `JobReport` objects (`deriveMetrics`, `flattenReport`) and the CSV.
+  - `mainThread.js` tracks Long Tasks / TBT and rAF frame gaps.
+  - `serverClient.js` talks to the optional `/bench-api`.
+  - `jobRunner.js` orchestrates: server session → worker or main → output verification → report.
+  - `harness.js` exposes `window.__nleBench` for Playwright.
 - `bench-server/server.mjs` uses Node built-ins only. It reads system CPU from `os.cpus()` deltas, per-process browser CPU from `ps` cputime deltas (grouped by Chrome `--type=`, optionally filtered to a root PID's process tree), and GPU from `ioreg` `Device Utilization %`.
 - `bench/run.mjs` is the Playwright runner. It adds CDP `Performance.getMetrics` deltas to each in-app report.
 
 ## Effects (text, stickers, transitions, filters, animations)
-- **Modules:** `src/media/effects/` holds `text.ts` (fonts, presets, layout/draw), `stickers.ts` (Path2D/emoji library), `filters.ts` (presets → `ctx.filter` + overlays for temperature, tint, vignette and grain), `animations.ts` (in/out/loop/reveal → per-frame `AnimState`) and `transitions.ts` (draw math).
-- **Shared rendering:** `compositor.ts` `layerItemsAt()` resolves each track at time t into clips or a transition (A + B + eased progress). `frameRequests()` lists the media frames needed, including transition partners past a clip's edge. `drawFrame()` renders them.
-  - The preview (`playback.ts`), the export (`jobs.ts`) and the gallery thumbnails (`components/fxThumbs.ts`) all use this same path. Keep it that way, so previews match exports.
-- **Video effects** (`effects/fx/videoEffects.ts`, 27 effects) are a per-clip stack (`clip.effects`).
+- **Modules:** `src/media/effects/` holds `text.js` (fonts, presets, layout/draw), `stickers.js` (Path2D/emoji library), `filters.js` (presets → `ctx.filter` + overlays for temperature, tint, vignette and grain), `animations.js` (in/out/loop/reveal → per-frame `AnimState`) and `transitions.js` (draw math).
+- **Shared rendering:** `compositor.js` `layerItemsAt()` resolves each track at time t into clips or a transition (A + B + eased progress). `frameRequests()` lists the media frames needed, including transition partners past a clip's edge. `drawFrame()` renders them.
+  - The preview (`playback.js`), the export (`jobs.js`) and the gallery thumbnails (`components/fxThumbs.js`) all use this same path. Keep it that way, so previews match exports.
+- **Video effects** (`effects/fx/videoEffects.js`, 27 effects) are a per-clip stack (`clip.effects`).
   - Each effect declares typed `params`, which the Inspector turns into controls automatically.
   - Each also has a Canvas2D `process(src → dst)` layer processor or a `motion()` transform modifier. Motion Trail is handled in `drawClip`.
-  - Clips with layer effects render alone into a pooled full-frame layer (`fx/util.ts` `acquire`/`release`, which must be released in the same frame), run through the chain, then composite.
-- **Advanced transitions** (`effects/fx/transitionsFx.ts`, 34 of the 49 total) get `TransitionSides`: draw a side in place, or as a full-frame layer for masks, smears and pixel tricks.
+  - Clips with layer effects render alone into a pooled full-frame layer (`fx/util.js` `acquire`/`release`, which must be released in the same frame), run through the chain, then composite.
+- **Advanced transitions** (`effects/fx/transitionsFx.js`, 34 of the 49 total) get `TransitionSides`: draw a side in place, or as a full-frame layer for masks, smears and pixel tricks.
   - Procedural masks (ink, smoke, film burn, luma) are built at 160×90 and upscaled.
 - **No WebGL by decision.** Perspective warp, ripple, fisheye, lens distortion, edge detection and posterize are intentionally not implemented.
-- **Text effects** (`TEXT_FX` in `text.ts`): kinetic, tracking, neon flicker, pop, 3D flip, glitch (which runs the glitch processor) and gradient fill.
+- **Text effects** (`TEXT_FX` in `text.js`): kinetic, tracking, neon flicker, pop, 3D flip, glitch (which runs the glitch processor) and gradient fill.
 - `npm run bench:fx` (`bench/fx-catalog.mjs`) exports every effect, transition and text effect through the worker, verifies each one, and writes per-effect composite cost to CSV.
 - **Adjustment clips** filter the canvas onto itself (`drawImage(ctx.canvas)`) for everything below them.
-- **Transitions** live in `project.transitions`, keyed by `leftId`/`rightId`. They are dropped by `pruneTransitions` (in `store.ts`) when clips stop touching. Splitting a clip moves end-transitions to the right half.
-- **Audio** linked to a video transition gets an equal-power dip (`makeGainFn` in `audioMix.ts`).
+- **Transitions** live in `project.transitions`, keyed by `leftId`/`rightId`. They are dropped by `pruneTransitions` (in `store.js`) when clips stop touching. Splitting a clip moves end-transitions to the right half.
+- **Audio** linked to a video transition gets an equal-power dip (`makeGainFn` in `audioMix.js`).
 - **No web fonts:** only system fonts are used, so text renders the same in the export worker.
-- **Clipboard:** `copySelection` / `pasteClipboard` / `duplicateSelection` / `pasteAttributes` live in `store.ts` and are wired to ⌘C/X/V/D and ⌥⌘V in `shortcuts.ts`.
-- **Box select:** dragging on empty timeline space draws a marquee (`onLanePointerDown` in `Timeline.tsx`). A click without a drag seeks.
+- **Clipboard:** `copySelection` / `pasteClipboard` / `duplicateSelection` / `pasteAttributes` live in `store.js` and are wired to ⌘C/X/V/D and ⌥⌘V in `shortcuts.js`.
+- **Box select:** dragging on empty timeline space draws a marquee (`onLanePointerDown` in `Timeline.jsx`). A click without a drag seeks.
 
 ## Timeline placement rule
-Clips never overwrite each other. `placeWithoutOverlap()` in `store.ts` handles adding media, adding a title, and drag-moves (applied on release).
+Clips never overwrite each other. `placeWithoutOverlap()` in `store.js` handles adding media, adding a title, and drag-moves (applied on release).
 - A clip that would collide goes to the nearest free track of the same kind (video searches upward, audio downward). If none is free, a new track is created.
-- Trims are clamped at the neighbouring clip (`trimLimits` in `Timeline.tsx`).
+- Trims are clamped at the neighbouring clip (`trimLimits` in `Timeline.jsx`).
 - `bench/ui-smoke.mjs` covers all of these.
 
 ## On-canvas transform
-`components/TransformOverlay.tsx` sits over the preview canvas.
-- It uses `clipBounds()` from `compositor.ts`, the same geometry `drawComposite` draws with, for hit-testing and the selection box.
+`components/TransformOverlay.jsx` sits over the preview canvas.
+- It uses `clipBounds()` from `compositor.js`, the same geometry `drawComposite` draws with, for hit-testing and the selection box.
 - Drags use window listeners and `updateGesture`/`endGesture`, so each move or scale is one undo step.
 
 ## Metric definitions
-`JobReport` in `src/bench/metrics.ts` is the source of truth, and `jobs.ts` fills the stage timers.
+The `JobReport` shape built in `src/bench/metrics.js` (`deriveMetrics`) and `jobRunner.js` is the source of truth, and `jobs.js` fills the stage timers.
 - **Encode time:** time spent awaiting `source.add()` (encoder queue and backpressure) plus finalize flush.
 - **Encoder latency:** submit → `onEncodedPacket`, per frame.
 - **Decode time:** time awaiting frames from sinks.
 - **Mediabunny `Conversion` jobs:** only total, init and time-to-first-progress can be measured, because decode and encode are pipelined internally. Use the "manual pipeline" engine for a per-stage split.
 - **Composite time** only counts 2D command submission. Canvas raster and readback land in encode wait (inside `CanvasSource.add`).
 - **TBT** is usually 0 even on the main thread, because the pipeline yields each frame. Compare modes with CDP `cdp_mainTaskMs`.
-- `verifyOutput` (in `jobRunner.ts`) re-probes each output and really decodes it (`decodeCheck` in `probe.ts`), so `--matrix` doubles as an import/decode test.
+- `verifyOutput` (in `jobRunner.js`) re-probes each output and really decodes it (`decodeCheck` in `probe.js`), so `--matrix` doubles as an import/decode test.
 
 ## Gotchas
 - COOP `same-origin` and COEP `require-corp` are required. The extension WASM uses shared-memory threads, so without them it falls back to a slower path and skews the benchmarks. Don't load cross-origin resources (fonts, CDNs) without CORP/CORS.
@@ -104,4 +104,4 @@ Clips never overwrite each other. `placeWithoutOverlap()` in `store.ts` handles 
 - MP4/MOV use `fastStart: 'in-memory'` only with `BufferTarget`. Streaming to disk (`StreamTarget` + `showSaveFilePicker`, Chromium only) uses `fastStart: false`.
 - HLS output writes many files, so it's greyed out in the UI.
 - Real GPU and hardware-encoder numbers need **headed** Chrome. Headless may fall back to software.
-- TypeScript is 7.x (from the Vite scaffold), with `noUnusedLocals`/`noUnusedParameters` on.
+- The code is plain JavaScript (converted from TypeScript). Source files are `.js`/`.jsx`, imports stay extensionless, and the worker is loaded as `new URL('../workers/media.worker.js', import.meta.url)`. `jsconfig.json` exists only for editor IntelliSense. There are no type annotations, so use JSDoc comments for anything worth documenting.

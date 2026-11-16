@@ -40,7 +40,7 @@ Scenarios are defined in `bench/scenarios.mjs`. Real media files can go in `benc
 ### What is measured
 | Metric | Source |
 |---|---|
-| Conversion time, setup, decode wait, composite, **encode time** (encoder submit/backpressure + finalize), audio mix | in-app stage timers (`src/media/jobs.ts`) |
+| Conversion time, setup, decode wait, composite, **encode time** (encoder submit/backpressure + finalize), audio mix | in-app stage timers (`src/media/jobs.js`) |
 | Encoder latency per frame (submit → encoded packet), encoder busy span, encoder codec string / HW preference | `onEncodedPacket` / `onEncoderConfig` |
 | Real-time factor, encode fps, output size and bitrate, peak JS heap | in-app |
 | Output verification: re-opened with Mediabunny, codec, duration and size checked | in-app |
