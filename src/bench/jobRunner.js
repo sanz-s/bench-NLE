@@ -102,6 +102,62 @@ async function verifyOutput(file, job, expectedDuration) {
 
 let counter = 0
 
+/**
+ * Page memory during a job (Chrome only; other browsers report nulls):
+ *  - mainHeapPeakMB: peak `performance.memory.usedJSHeapSize` of the MAIN thread (sampled every 500 ms; not workers)
+ *  - pageTotalMB (OPT-IN: opts.pageMemory or localStorage['bench.pageMemory'] = '1'):
+ *    `performance.measureUserAgentSpecificMemory()` for the page AND its workers (needs cross-origin isolation).
+ *    Chrome answers at a garbage collection it may trigger itself (13 s in testing, up to ~20 s), which could land a
+ *    GC pause inside the timed export — so it's off by default. When on, it's started at job start and waited for
+ *    at most 1.5 s after the job; short jobs often get null.
+ */
+function startPageMemoryProbe(wantPageTotal) {
+  const used = () => (performance.memory ? performance.memory.usedJSHeapSize / 1048576 : null)
+  let peak = used()
+  const timer = setInterval(() => {
+    const v = used()
+    if (v !== null) peak = Math.max(peak ?? 0, v)
+  }, 500)
+  let ua = null
+  let uaPending = null
+  if (wantPageTotal && globalThis.crossOriginIsolated && typeof performance.measureUserAgentSpecificMemory === 'function') {
+    uaPending = performance
+      .measureUserAgentSpecificMemory()
+      .then((m) => {
+        const byScope = {}
+        for (const b of m.breakdown ?? []) {
+          const kind = b.attribution?.[0]?.scope ?? (b.types?.join('+') || 'other') // "Window", "DedicatedWorker", or a type like "DOM"
+          byScope[kind] = (byScope[kind] ?? 0) + b.bytes / 1048576
+        }
+        ua = { totalMB: m.bytes / 1048576, byScope }
+      })
+      .catch(() => null)
+  }
+  return {
+    async stop() {
+      clearInterval(timer)
+      const v = used()
+      if (v !== null) peak = Math.max(peak ?? 0, v)
+      if (uaPending) await Promise.race([uaPending, new Promise((r) => setTimeout(r, 1500))])
+      return {
+        mainHeapPeakMB: peak,
+        pageTotalMB: ua?.totalMB ?? null,
+        pageByScopeMB: ua?.byScope ?? null,
+        method: {
+          mainHeap: performance.memory ? 'performance.memory.usedJSHeapSize (main thread only)' : 'unavailable in this browser',
+          pageTotal: !wantPageTotal
+            ? 'off (opt-in: may trigger a GC during the job)'
+            : uaPending
+              ? ua
+                ? 'measureUserAgentSpecificMemory (page + workers)'
+                : 'measureUserAgentSpecificMemory did not resolve within the job + 1.5 s'
+              : 'unavailable (needs cross-origin isolation + Chromium)',
+        },
+      }
+    },
+  }
+}
+
 /** Full benchmark run: system session → job → main-thread stats → verification → report. */
 export async function runAndReport(job, opts) {
   const id = `${Date.now().toString(36)}-${(counter++).toString(36)}`
@@ -134,6 +190,13 @@ export async function runAndReport(job, opts) {
       }
     },
   }
+  let pageMemPref = false
+  try {
+    pageMemPref = localStorage.getItem('bench.pageMemory') === '1'
+  } catch {
+    /* no storage in this context */
+  }
+  const memProbe = startPageMemoryProbe(opts.pageMemory ?? pageMemPref)
   const wallStart = performance.now()
   let result = null
   let error
@@ -158,6 +221,7 @@ export async function runAndReport(job, opts) {
   }
   const input = inputSummary(job)
   const verify = file && result ? await verifyOutput(file, job, result.mediaDuration) : null
+  const memory = await memProbe.stop() // after wallMs/timings, so waiting for it never inflates them
   const bytes = result?.outputBytes ?? 0
   const report = {
     id,
@@ -185,6 +249,7 @@ export async function runAndReport(job, opts) {
     mainThread,
     system,
     peakHeapMB: result?.peakHeapMB ?? null,
+    memory,
     verify,
     env,
   }

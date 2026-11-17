@@ -24,7 +24,8 @@ function benchApiBridge() {
       try {
         const r = await fetch(BENCH_SERVER + req.url.slice('/bench-api'.length), {
           method: req.method,
-          headers: { 'content-type': 'application/json' },
+          // The browser's socket ports let the bench-server find WHICH browser process made this request (lsof).
+          headers: { 'content-type': 'application/json', 'x-bench-peer-port': String(req.socket.remotePort ?? ''), 'x-bench-page-port': String(req.socket.localPort ?? '') },
           body: req.method === 'GET' || req.method === 'HEAD' ? undefined : Buffer.concat(chunks),
           signal: AbortSignal.timeout(5000),
         })

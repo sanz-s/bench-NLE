@@ -12,7 +12,8 @@
     "bench": "npm run build && node bench/run.mjs",
     "test:ui": "npm run build && node bench/ui-smoke.mjs && node bench/effects-smoke.mjs",
     "bench:matrix": "npm run build && node bench/run.mjs --matrix",
-    "bench:fx": "npm run build && node bench/fx-catalog.mjs"
+    "bench:fx": "npm run build && node bench/fx-catalog.mjs",
+    "test:bench-server": "node --test bench-server/probes.test.mjs"
   },
   "dependencies": {
     "@mediabunny/aac-encoder": "^1.65.2",

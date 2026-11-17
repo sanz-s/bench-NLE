@@ -39,10 +39,13 @@ export function serverHealth() {
 }
 
 export async function startSession(label, meta) {
-  const r = await call('/sessions', {
-    method: 'POST',
-    body: JSON.stringify({ label, rootPid, source: automated ? 'playwright' : 'editor', ...meta }),
-  })
+  // pagePort: fallback for finding this browser's processes when the request doesn't come through the Vite bridge.
+  // Longer timeout: the server looks the browser up with lsof before answering.
+  const r = await call(
+    '/sessions',
+    { method: 'POST', body: JSON.stringify({ label, rootPid, pagePort: Number(location.port) || null, source: automated ? 'playwright' : 'editor', ...meta }) },
+    5000,
+  )
   return r?.id ?? null
 }
 

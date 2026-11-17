@@ -20,7 +20,7 @@ A browser-based non-linear video editor (NLE) whose purpose is **benchmarking Me
   - The server stores each job as one record (report + CPU/GPU/main-thread series) in `bench-results/exports.jsonl`.
   - Records carry `source: editor|playwright`. Playwright is detected via `setRootPid`/`setAutomated`.
   - Chart colors follow entities, using the dataviz palette, validated on `#17181b`. Stage bars use 4 fixed groups so any subset keeps valid neighbour pairs.
-- `npm run bench:server`: CPU/GPU sampler for the terminal on :5199. `sudo npm run bench:server -- --powermetrics` adds CPU/GPU power and frequency.
+- `npm run bench:server`: CPU/GPU sampler for the terminal on :5199. `sudo npm run bench:server -- --powermetrics` adds CPU/GPU power, GPU frequency and Apple Silicon E/P-cluster frequency and active residency (`cpuClusters`). `--process-gpu` (also sudo) adds powermetrics' tasks sampler for per-process GPU time. It's opt-in because it costs ~80 ms/s CPU, and on macOS 26 every task reads 0 GPU ms/s, so the value stays null unless macOS reports it. `npm run test:bench-server` runs the OS-parser fixture tests.
 - `npm run bench`: builds, starts `vite preview`, drives headed Google Chrome with Playwright through the scenarios in `bench/scenarios.mjs`, and writes `bench-results/*.json|csv`.
   - `npm run bench -- --scenario <id>` runs one scenario.
   - `--runs N` sets the repeat count (median is reported).
@@ -53,7 +53,16 @@ A browser-based non-linear video editor (NLE) whose purpose is **benchmarking Me
   - `serverClient.js` talks to the optional `/bench-api`.
   - `jobRunner.js` orchestrates: server session → worker or main → output verification → report.
   - `harness.js` exposes `window.__nleBench` for Playwright.
-- `bench-server/server.mjs` uses Node built-ins only. It reads system CPU from `os.cpus()` deltas, per-process browser CPU from `ps` cputime deltas (grouped by Chrome `--type=`, optionally filtered to a root PID's process tree), and GPU from `ioreg` `Device Utilization %`.
+- `bench-server/server.mjs` uses Node built-ins plus one small native helper. All OS-output parsing lives in `bench-server/probes.mjs` (pure functions; `npm run test:bench-server` runs fixture tests, macOS fixtures are real captures). Per platform:
+  - **macOS:** `bench-server/native/procstat.c` (compiled with clang on first start, gitignored binary; `BENCH_NO_NATIVE=1` disables it) streams pid/ppid/CPU ns/phys_footprint/RSS/path via `proc_pid_rusage`. It costs ~2–3 % of one core, versus ~38 % for `ps` + `top`. Without it: `ps` CPU/RSS, no footprint. GPU from `ioreg` (busiest GPU). VideoToolbox `VTEncoderXPCService`/`VTDecoderXPCService` CPU/memory is recorded separately (`mediaEncoderCpuPct`), because hardware encode runs there and the Media Engine itself is not exposed.
+  - **Linux:** `/proc/<pid>/stat` (clock-tick CPU), `smaps_rollup` PSS, `/proc/net/tcp` + fd scan for attribution, NVIDIA `nvidia-smi` (all GPUs, encoder/decoder, power), AMD sysfs `gpu_busy_percent`, RAPL package power. Tested in a Linux container with a fake browser.
+  - **Windows (written, UNTESTED):** two long-lived PowerShell loops (they exit with the server): `Win32_Process` (CPU, private bytes, parents) and `Get-Counter` `\GPU Engine(*)` / `\GPU Process Memory(*)` (per engine incl. VideoEncode/Decode, per browser PID). `Get-NetTCPConnection` for attribution. Counter names are English-only.
+  - **Which processes count as "the browser"** (`attribution` in each summary's `method`):
+    1. `playwright-pid`: Playwright passes the browser PID (`setRootPid`). That root is always kept, whatever its binary is called (e.g. `chrome-headless-shell`).
+    2. `socket`: editor exports. The Vite bridge forwards the browser socket's port (`x-bench-peer-port`); `resolveBrowserRoot()` finds the socket's owner (`lsof` on macOS, `/proc/net/tcp` on Linux, `Get-NetTCPConnection` on Windows) and walks up to the browser main process. A WebKit-service owner means Safari (`safari-webkit`: Safari plus all WebKit services). Requests that skip the bridge send `pagePort` instead (`page-port-ambiguous` if several browsers are connected).
+    3. `name-match`: fallback. Executable basenames (`BROWSER_EXE_RE` in `probes.mjs`, never whole command lines) plus their descendants.
+  - Non-browser children (extension native-messaging hosts, crashpad) are always dropped, except renamed Firefox children on Linux. Firefox child roles (tab, gpu, rdd, socket) map onto Chrome's process types.
+  - Each session stores an idle `baseline` (the ~2 s of samples before it started). `method` also records the CPU, RAM, GPU and power sources. The dashboard detail shows all of them, with a ⚠ for name-match and older records.
 - `bench/run.mjs` is the Playwright runner. It adds CDP `Performance.getMetrics` deltas to each in-app report.
 
 ## Effects (text, stickers, transitions, filters, animations)
@@ -95,6 +104,19 @@ The `JobReport` shape built in `src/bench/metrics.js` (`deriveMetrics`) and `job
 - **Mediabunny `Conversion` jobs:** only total, init and time-to-first-progress can be measured, because decode and encode are pipelined internally. Use the "manual pipeline" engine for a per-stage split.
 - **Composite time** only counts 2D command submission. Canvas raster and readback land in encode wait (inside `CanvasSource.add`).
 - **TBT** is usually 0 even on the main thread, because the pipeline yields each frame. Compare modes with CDP `cdp_mainTaskMs`.
+- **Extra per-job fields:**
+  - `browserFootprintMB`: the real footprint. Prefer it to `browserRssMB`, which over-counts shared memory.
+  - `baseline`: idle CPU/GPU and `backgroundLoad` before the job.
+  - `conditions`: power source, low-power mode, thermal state.
+  - `samplerOverhead`: the server's own CPU, its probes, and spawns per sample.
+  - `report.memory`: main-thread JS heap peak (always on).
+  - Page + workers memory via `measureUserAgentSpecificMemory` is opt-in (`localStorage['bench.pageMemory'] = '1'`). Chrome answers at a GC it may trigger mid-export (about 13 s in testing), so it is off by default, and jobs shorter than that get null.
+  - CPU baselines are kept for every pid, so the first sample of a job has a value.
+- **CPU/GPU/RAM limits (known):**
+  - Media Engine load and per-tab attribution inside a user's own Chrome are not measurable.
+  - macOS per-process GPU: powermetrics lists a GPU ms/s column but reports 0.00 for every task on macOS 26 (`--process-gpu` picks it up if that changes).
+  - Safari is a WebKit name group, shared with other WebKit apps.
+  - Windows paths are untested.
 - `verifyOutput` (in `jobRunner.js`) re-probes each output and really decodes it (`decodeCheck` in `probe.js`), so `--matrix` doubles as an import/decode test.
 
 ## Gotchas

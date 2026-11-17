@@ -66,6 +66,7 @@
   .badge.kind-convert { color: #7fd8b2; border-color: rgba(25, 158, 112, 0.45); }
   .ok { color: #59d659; }
   .bad { color: #ff8a8a; }
+  .warn { color: var(--warning); }
 
   /* live */
   .waiting { display: flex; align-items: center; gap: 14px; padding: 26px 18px; }
@@ -353,7 +354,7 @@ function renderSeriesCharts(root, series, tMax) {
       <div class="chart"><div class="chart-head"><span class="chart-title">CPU</span><span class="legend"><span><i class="swatch" style="background:var(--c-cpu)"></i>System</span><span><i class="swatch" style="background:var(--c-chrome)"></i>Chrome (share of all cores)</span></span></div><canvas data-c="cpu"></canvas></div>
       <div class="chart"><div class="chart-head"><span class="chart-title">GPU utilization</span><span class="legend muted">whole GPU (ioreg)</span></div><canvas data-c="gpu"></canvas></div>
       <div class="chart"><div class="chart-head"><span class="chart-title">Main-thread blocking</span><span class="legend muted">long-task time per 0.5 s</span></div><canvas data-c="main"></canvas></div>
-      <div class="chart"><div class="chart-head"><span class="chart-title">Chrome memory</span><span class="legend muted">all browser processes (RSS)</span></div><canvas data-c="mem"></canvas></div>`
+      <div class="chart"><div class="chart-head"><span class="chart-title">Chrome memory</span><span class="legend muted" data-l="mem">all browser processes (RSS)</span></div><canvas data-c="mem"></canvas></div>`
     root._built = true
     root.querySelectorAll('canvas').forEach((cv) =>
       attachHover(cv, (v, s) => (v == null ? '—' : s.unit === 'GB' ? `${v.toFixed(2)} GB` : s.unit === 'ms' ? `${Math.round(v)} ms` : `${v.toFixed(0)}%`)),
@@ -366,7 +367,10 @@ function renderSeriesCharts(root, series, tMax) {
   drawChart(cv('cpu'), { tMax, yMax: 100, unit: '%', series: [{ name: 'System', color: css('--c-cpu'), points: pt('cpu') }, { name: 'Chrome', color: css('--c-chrome'), points: pt('chrome') }] })
   drawChart(cv('gpu'), { tMax, yMax: 100, unit: '%', series: [{ name: 'GPU', color: css('--c-gpu'), points: pt('gpu') }] })
   drawChart(cv('main'), { tMax, yFloor: 40, unit: 'ms', series: [{ name: 'Blocked', color: css('--c-main'), kind: 'bar', barWidthMs: 500, unit: 'ms', points: M.map((b) => ({ t: b.t, v: b.blockedMs })) }] })
-  drawChart(cv('mem'), { tMax, yFloor: 1, unit: 'G', series: [{ name: 'RSS', color: css('--c-mem'), unit: 'GB', points: pt('rssMB', 1 / 1024) }] })
+  // Real footprint when the server measured it (phys_footprint / PSS / private bytes); RSS (over-counts shared memory) otherwise.
+  const hasFp = S.some((s) => s.footprintMB != null)
+  root.querySelector('[data-l="mem"]').textContent = hasFp ? 'browser processes, real footprint' : 'all browser processes (RSS, over-counts shared memory)'
+  drawChart(cv('mem'), { tMax, yFloor: 1, unit: 'G', series: [{ name: hasFp ? 'Footprint' : 'RSS', color: css('--c-mem'), unit: 'GB', points: pt(hasFp ? 'footprintMB' : 'rssMB', 1 / 1024) }] })
 }
 
 // ---------------------------------------------------------------- live monitor
@@ -427,7 +431,7 @@ function renderLive(mon) {
     liveTile('GPU', fmtPct(last.gpu), `avg ${fmtPct(avg('gpu'))}`, css('--c-gpu')),
     liveTile('Main-thread blocked', fmtMs(blocked), `${longTasks} long tasks · TBT ${fmtMs(tbt)}`, css('--c-main')),
     liveTile('Longest task', fmtMs(maxTask), maxTask > 50 ? 'over the 50 ms budget' : 'within 50 ms budget'),
-    liveTile('Chrome memory', last.rssMB ? `${(last.rssMB / 1024).toFixed(2)} GB` : '—', '', css('--c-mem')),
+    liveTile('Chrome memory', last.footprintMB ? `${(last.footprintMB / 1024).toFixed(2)} GB` : last.rssMB ? `${(last.rssMB / 1024).toFixed(2)} GB` : '—', last.footprintMB ? `footprint · RSS ${(last.rssMB / 1024).toFixed(2)} GB` : 'RSS', css('--c-mem')),
     ...(last.gpuW != null ? [liveTile('GPU power', `${last.gpuW.toFixed(1)} W`, `CPU ${last.cpuW?.toFixed(1) ?? '—'} W`)] : []),
   ].join('')
   renderSeriesCharts($('.charts', live), mon.series, Math.max(10000, elapsed + 1000))
@@ -569,6 +573,24 @@ async function openDetail(id) {
   ].filter(([, v]) => v > 0)
   const total = stageItems.reduce((a, [, v]) => a + v, 0)
   const kv = (k, v) => `<div><dt>${k}</dt><dd title="${String(v).replace(/<[^>]+>/g, '').replace(/"/g, '&quot;')}">${v}</dd></div>`
+  const conditionsText = (c) => {
+    const bits = []
+    if (c.powerSource) bits.push(c.powerSource === 'battery' ? `<span class="warn">⚠ on battery${c.batteryPct != null ? ` (${c.batteryPct}%)` : ''}</span>` : esc(c.powerSource) + (c.batteryPct != null ? ` (${c.batteryPct}%)` : ''))
+    if (c.lowPowerMode) bits.push('<span class="warn">⚠ low power mode</span>')
+    if (c.thermalWarning != null && c.thermalWarning !== 'none') bits.push(`<span class="warn">⚠ thermal warning ${esc(c.thermalWarning)}</span>`)
+    if (c.cpuSpeedLimitPct != null && c.cpuSpeedLimitPct < 100) bits.push(`<span class="warn">⚠ CPU speed limit ${c.cpuSpeedLimitPct}%</span>`)
+    if (c.maxTempC != null) bits.push(`${c.maxTempC.toFixed(0)} °C max`)
+    if (c.thermalWarning === 'none') bits.push('no thermal warning')
+    return bits.join(' · ') || '—'
+  }
+  // How Chrome CPU / memory were attributed. Name matches and older records may include other browsers' processes.
+  const attributionText = (s) => {
+    const a = s.method?.attribution
+    if (!a) return s.processFilter ? `<span class="warn">⚠ ${esc(s.processFilter)} (older record)</span>` : '—'
+    const label = { 'playwright-pid': '✓ Playwright PID', socket: '✓ this tab’s browser (all its tabs)', 'safari-webkit': '⚠ Safari: WebKit services are shared with other apps', 'page-port-ambiguous': '⚠ several browsers on this port', 'name-match': '⚠ name match: may include other browsers' }[a.method] ?? a.method
+    const cls = a.method === 'playwright-pid' || a.method === 'socket' ? 'ok' : 'warn'
+    return `<span class="${cls}">${esc(label)}</span> <span class="muted">${esc(a.via ?? '')}</span>`
+  }
   const yn = (v) => (v == null ? 'n/a' : v ? 'yes' : 'no (re-encoded)')
   const dur = (rec.meta.endedAt ?? 0) - rec.meta.startedAt
   el.innerHTML = `
@@ -610,9 +632,22 @@ async function openDetail(id) {
       ${kv('Frame gaps > 50 ms', mt.rafGapsOver50ms ?? '—')}
       ${kv('Chrome CPU avg', sys.browserCpuPct ? `${(sys.browserCpuPct.avg / 100).toFixed(1)} cores` : '—')}
       ${Object.entries(sys.browserCpuByType ?? {}).map(([k, s]) => kv(`  ${k}`, `${(s.avg / 100).toFixed(2)} cores avg`)).join('')}
-      ${kv('Chrome memory max', sys.browserRssMB ? `${(sys.browserRssMB.max / 1024).toFixed(2)} GB` : '—')}
+      ${kv('Chrome memory max', sys.browserFootprintMB ? `${(sys.browserFootprintMB.max / 1024).toFixed(2)} GB footprint · ${(sys.browserRssMB.max / 1024).toFixed(2)} GB RSS` : sys.browserRssMB ? `${(sys.browserRssMB.max / 1024).toFixed(2)} GB RSS` : '—')}
+      ${r.memory?.mainHeapPeakMB != null || r.memory?.pageTotalMB != null ? kv('JS heap', `main ${r.memory.mainHeapPeakMB != null ? r.memory.mainHeapPeakMB.toFixed(0) + ' MB peak' : '—'} · page+workers ${r.memory.pageTotalMB != null ? r.memory.pageTotalMB.toFixed(0) + ' MB' : '—'}`) : ''}
+      ${sys.browserGpuMemMB ? kv('Browser GPU memory', `${sys.browserGpuMemMB.max.toFixed(0)} MB max`) : ''}
       ${sys.gpuPowerW ? kv('GPU / CPU power', `${sys.gpuPowerW.avg.toFixed(2)} W / ${sys.cpuPowerW?.avg.toFixed(2)} W`) : ''}
       ${kv('Verification', r.verify ? (r.verify.ok ? `✓ ${esc(r.verify.container)} ${esc(r.verify.videoCodec ?? '')}/${esc(r.verify.audioCodec ?? '')} ${r.verify.duration?.toFixed(2)} s` : `⚠ ${esc(r.verify.problems.join('; '))}`) : '—')}
+      ${kv('Browser processes', attributionText(sys))}
+      ${sys.baseline?.samples ? kv('Idle baseline (2 s before)', `CPU ${fmtPct(sys.baseline.cpuSystemPct)} · GPU ${fmtPct(sys.baseline.gpuDevicePct)}${sys.baseline.gpuPowerW != null ? ` · ${sys.baseline.gpuPowerW.toFixed(1)} W GPU` : ''}`) : ''}
+      ${sys.gpuEncoderPct ? kv('GPU encoder / decoder', `${fmtPct(sys.gpuEncoderPct.avg)} / ${fmtPct(sys.gpuDecoderPct?.avg)} avg`) : ''}
+      ${sys.method?.gpu ? kv('GPU source', esc(sys.method.gpu)) : ''}
+      ${sys.mediaEncoderCpuPct || sys.mediaDecoderCpuPct ? kv('VideoToolbox services', `encoder ${fmtPct(sys.mediaEncoderCpuPct?.avg)} · decoder ${fmtPct(sys.mediaDecoderCpuPct?.avg)} CPU avg${sys.mediaServiceFootprintMB ? ` · ${sys.mediaServiceFootprintMB.max.toFixed(0)} MB` : ''}`) : ''}
+      ${sys.gpuBrowserPct ? kv('Browser GPU (3D / encode)', `${fmtPct(sys.gpuBrowserPct.avg)} / ${fmtPct(sys.gpuBrowserEncoderPct?.avg)} avg`) : ''}
+      ${sys.cpuClusters ? kv('CPU clusters (avg)', Object.entries(sys.cpuClusters).map(([k, c]) => `${esc(k)} ${c.mhz ? c.mhz.avg.toFixed(0) + ' MHz' : '—'} · ${fmtPct(c.activePct?.avg)} active`).join(' | ')) : ''}
+      ${sys.conditions ? kv('Run conditions', conditionsText(sys.conditions)) : ''}
+      ${sys.baseline?.backgroundLoad?.length ? kv('Background load before', sys.baseline.backgroundLoad.map((b) => `${esc(b.exe)} ${b.cpuPct.toFixed(0)}%`).join(' · ')) : ''}
+      ${sys.samplerOverhead ? kv('Sampler overhead', `server ${fmtPct(sys.samplerOverhead.serverCpuPct, 1)} · probes ${fmtPct(sys.samplerOverhead.probeCpuPct, 1)} of a core · ${sys.samplerOverhead.spawnsPerSample?.toFixed(1) ?? '—'} spawns/sample`) : ''}
+      ${/HeadlessChrome/.test(r.env?.userAgent ?? '') ? kv('Browser mode', '<span class="warn">⚠ headless: GPU / encoder numbers may be software fallbacks</span>') : ''}
       ${kv('Recorded samples', `${rec.series.samples.length} CPU/GPU · ${rec.series.mainThread.length} main-thread`)}
     </dl>`
   $('#close-detail').onclick = () => {

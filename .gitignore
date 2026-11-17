@@ -26,3 +26,6 @@ dist-ssr
 bench-results/
 bench/fixtures/*
 !bench/fixtures/.gitkeep
+
+# compiled on first bench-server start
+bench-server/native/procstat
