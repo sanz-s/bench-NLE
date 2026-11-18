@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useState } from 'react'
 import { getCapabilities } from '../../media/capabilities'
+import { nativeAacSupported } from '../../media/extensions'
 import { timelineDuration } from '../../media/compositor'
 import { canStreamToDisk, startConvert, startExport } from '../actions'
 import { setState, useStore } from '../store'
@@ -116,6 +117,10 @@ function Modal({ title, children, footer, onClose }) {
 }
 
 function EncodeForm({ s, set, caps, duration, sourceSize }) {
+  const [nativeAac, setNativeAac] = useState(null)
+  useEffect(() => {
+    void nativeAacSupported().then(setNativeAac)
+  }, [])
   const cur = caps?.find((c) => c.id === s.container)
   const estimate = s.qualityMode === 'bitrate' ? (((s.videoCodec ? s.videoBitrate : 0) + (s.audioCodec ? s.audioBitrate : 0)) * duration) / 8 : null
   const sizes = [
@@ -303,6 +308,18 @@ function EncodeForm({ s, set, caps, duration, sourceSize }) {
                   <option value={48000}>48 kHz</option>
                 </select>
               </label>
+              {s.audioCodec === 'aac' && (
+                <label className="form-field" title="Which AAC encoder to benchmark. Auto uses the browser's own encoder when it has one.">
+                  <span>AAC encoder</span>
+                  <select value={s.aacEncoder ?? 'auto'} onChange={(e) => set({ aacEncoder: e.target.value })}>
+                    <option value="auto">Auto ({nativeAac === false ? 'WASM: no native AAC here' : 'browser native'})</option>
+                    <option value="native" disabled={nativeAac === false}>
+                      Browser native (WebCodecs){nativeAac === false ? ' · not available' : ''}
+                    </option>
+                    <option value="wasm">WASM extension (FFmpeg)</option>
+                  </select>
+                </label>
+              )}
             </>
           )}
         </div>

@@ -10,12 +10,14 @@
  *   flags: --headless  --chromium (bundled Chromium instead of installed Chrome)  --out bench-results
  *          --full-verify (decode every frame/sample of each output; default for --matrix, --quick-verify turns it off)
  *          --fail-on-skip (unsupported scenarios also fail the run)
+ *          --aac auto|native|wasm (AAC encoder under test; auto = the browser's own when it has one; recorded per run)
  * Medians use only runs that finished AND passed output verification. Exit code is 1 if any run failed.
  *
  * What it records per run (merged into one row):
  *   in-app   conversion time, encode time, stage split, encoder latency, fps, output verification
  *   page     main-thread Long Tasks / TBT / longest task / rAF gaps (PerformanceObserver in the page)
- *   CDP      Performance.getMetrics deltas: TaskDuration, ScriptDuration, LayoutDuration, RecalcStyleDuration
+ *   CDP      Performance.getMetrics deltas: TaskDuration, ScriptDuration, LayoutDuration, RecalcStyleDuration,
+ *            over the job only (snapshots at jobRunner's job-start / job-end gates; cdp_window says which)
  *   server   CPU / GPU / browser-process CPU from `npm run bench:server` (if running), filtered to this browser's PID tree
  */
 import { chromium } from 'playwright'
@@ -43,6 +45,9 @@ const MATRIX = has('matrix')
 // full-file decode in the verifier (every frame/sample): on for --matrix, opt-in otherwise (slow on long outputs)
 const FULL_VERIFY = has('full-verify') || (MATRIX && !has('quick-verify'))
 const SERVER = val('server', 'http://127.0.0.1:5199')
+// AAC encoder under test: auto (native when the browser has it) | native (WebCodecs) | wasm (@mediabunny/aac-encoder)
+const AAC = val('aac', 'auto')
+if (!['auto', 'native', 'wasm'].includes(AAC)) throw new Error(`--aac must be auto, native or wasm (got ${AAC})`)
 
 const log = (...a) => console.log('[bench]', ...a)
 
@@ -147,11 +152,17 @@ async function main() {
   if (!isolated) log('WARNING: page is not cross-origin isolated; extension WASM will use slower threading')
   await page.evaluate((pid) => window.__nleBench.setRootPid(pid), browserPid)
   await page.evaluate((on) => (on ? localStorage.setItem('bench.fullVerify', '1') : localStorage.removeItem('bench.fullVerify')), FULL_VERIFY)
+  await page.evaluate((m) => localStorage.setItem('bench.aacEncoder', m), AAC)
   log(`output verification: ${FULL_VERIFY ? 'full decode (every frame and sample)' : 'head + tail decode'}`)
   const selfTest = await page.evaluate(() => window.__nleBench.selfTestMainThread())
   log(`main-thread probe self-test (3 × 120 ms injected): ${selfTest.longTasks} long tasks, TBT ${Math.round(selfTest.tbtMs)} ms, longest ${Math.round(selfTest.longestTaskMs)} ms${selfTest.longTaskSupported ? '' : ' (Long Tasks API unsupported!)'}`)
   const cdp = await context.newCDPSession(page)
   await cdp.send('Performance.enable', { timeDomain: 'timeTicks' })
+  // jobRunner calls this right before and right after the job; the page waits while we snapshot
+  let gateSnaps = {}
+  await page.exposeFunction('__nleBenchGate', async (name) => {
+    gateSnaps[name] = await cdpMetrics(cdp)
+  })
 
   const caps = await page.evaluate(() => window.__nleBench.capabilities())
   mkdirSync(OUT, { recursive: true })
@@ -189,6 +200,7 @@ async function main() {
       }, [w, h, assetId, sc.timeline ?? 'basic'])
     }
     const before = await cdpMetrics(cdp)
+    gateSnaps = {}
     if (TRACE) {
       mkdirSync(path.join(OUT, 'traces'), { recursive: true })
       await browser.startTracing(page, { path: path.join(OUT, 'traces', `${stamp}_${sc.id}_${runIndex}.json`), categories: ['devtools.timeline', 'disabled-by-default-devtools.timeline', 'toplevel', 'v8', 'blink', 'gpu', 'media'] })
@@ -205,7 +217,9 @@ async function main() {
     )
     if (TRACE) await browser.stopTracing()
     const after = await cdpMetrics(cdp)
-    report.cdp = cdpDelta(before, after)
+    // job-only window when the page reached both gates (jobRunner.gate); else the whole evaluate (incl. verification)
+    const job = gateSnaps['job-start'] && gateSnaps['job-end']
+    report.cdp = { ...(job ? cdpDelta(gateSnaps['job-start'], gateSnaps['job-end']) : cdpDelta(before, after)), window: job ? 'job' : 'whole-run', wholeRunTaskMs: cdpDelta(before, after).mainTaskMs }
     const row = await page.evaluate((r) => window.__nleBench.flatten(r), report)
     return { report, row: { scenario: sc.id, run: runIndex + 1, ...row } }
   }
@@ -266,6 +280,7 @@ async function main() {
           scenario: sc.id,
           'passed/runs': `${sum.passed}/${sum.runs}`,
           runIn: m.runIn,
+          audioEnc: m.audioEncoderImpl,
           convMs: m.conversionMs,
           encMs: m.encodeMs,
           'x realtime': m.realtimeX,

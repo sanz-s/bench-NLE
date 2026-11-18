@@ -203,6 +203,63 @@ function startPageMemoryProbe(wantPageTotal) {
   }
 }
 
+/**
+ * Tab visibility during a job. A hidden tab throttles timers and rAF (and, in main-thread mode, the job itself), so
+ * main-thread numbers and the progress stream of such a run are not comparable. Playwright disables backgrounding;
+ * editor runs in the user's own Chrome don't.
+ */
+function startVisibilityWatch() {
+  if (typeof document === 'undefined') return () => null
+  const t0 = performance.now()
+  const startedHidden = document.visibilityState === 'hidden'
+  let hiddenSince = startedHidden ? t0 : null
+  let hiddenMs = 0
+  let changes = 0
+  let blurs = 0
+  const onVis = () => {
+    changes++
+    const t = performance.now()
+    if (document.visibilityState === 'hidden') hiddenSince ??= t
+    else if (hiddenSince !== null) {
+      hiddenMs += t - hiddenSince
+      hiddenSince = null
+    }
+  }
+  const onBlur = () => blurs++
+  document.addEventListener('visibilitychange', onVis)
+  window.addEventListener('blur', onBlur)
+  const focusedAtStart = document.hasFocus()
+  return () => {
+    document.removeEventListener('visibilitychange', onVis)
+    window.removeEventListener('blur', onBlur)
+    const t = performance.now()
+    if (hiddenSince !== null) hiddenMs += t - hiddenSince
+    return { startedHidden, endedHidden: document.visibilityState === 'hidden', hiddenMs, hiddenPct: t > t0 ? (hiddenMs / (t - t0)) * 100 : 0, changes, focusedAtStart, blurs }
+  }
+}
+
+/**
+ * Playwright hook: bench/run.mjs exposes `__nleBenchGate(name)` and takes its CDP snapshot inside it, so CDP
+ * main-thread time covers only the job (not session setup, verification or reporting). A no-op in the editor.
+ */
+async function gate(name) {
+  if (typeof globalThis.__nleBenchGate === 'function') {
+    try {
+      await globalThis.__nleBenchGate(name)
+    } catch {
+      /* the runner went away */
+    }
+  }
+}
+
+function readPref(key) {
+  try {
+    return localStorage.getItem(key)
+  } catch {
+    return null /* no storage in this context */
+  }
+}
+
 /** Full benchmark run: system session → job → main-thread stats → verification → report. */
 export async function runAndReport(job, opts) {
   const id = `${Date.now().toString(36)}-${(counter++).toString(36)}`
@@ -235,13 +292,10 @@ export async function runAndReport(job, opts) {
       }
     },
   }
-  let pageMemPref = false
-  try {
-    pageMemPref = localStorage.getItem('bench.pageMemory') === '1'
-  } catch {
-    /* no storage in this context */
-  }
+  const pageMemPref = readPref('bench.pageMemory') === '1'
   const memProbe = startPageMemoryProbe(opts.pageMemory ?? pageMemPref)
+  const stopVisibility = startVisibilityWatch()
+  await gate('job-start')
   const wallStart = performance.now()
   let result = null
   let error
@@ -254,8 +308,15 @@ export async function runAndReport(job, opts) {
     error = err instanceof Error ? err.message : String(err)
   }
   const wallMs = performance.now() - wallStart
+  const visibility = stopVisibility()
   const mainThread = stopMain()
   stopStream()
+  // The server takes its last CPU/GPU sample now and ignores later ones, so the tail (waiting for the last
+  // main-thread bucket, verification, the report) never dilutes the job's averages.
+  if (sessionId) await markSession(sessionId, 'job-end')
+  await gate('job-end')
+  // heap peak: stopped before verification, whose probe + decode would otherwise count as the job's memory
+  const memory = await memProbe.stop()
   if (sessionId) await new Promise((r) => setTimeout(r, 150)) // let the final main-thread bucket arrive
   const system = sessionId ? await stopSession(sessionId) : null
 
@@ -265,14 +326,8 @@ export async function runAndReport(job, opts) {
     else if (job.target.kind === 'stream') file = await job.target.handle.getFile()
   }
   const input = inputSummary(job)
-  let fullVerify = false
-  try {
-    fullVerify = opts.fullVerify ?? localStorage.getItem('bench.fullVerify') === '1'
-  } catch {
-    /* no storage in this context */
-  }
+  const fullVerify = opts.fullVerify ?? readPref('bench.fullVerify') === '1'
   const verify = file && result ? await verifyOutput(file, job, result.mediaDuration, { tracks: result.tracks, mimeType: result.mimeType, full: fullVerify }) : null
-  const memory = await memProbe.stop() // after wallMs/timings, so waiting for it never inflates them
   const bytes = result?.outputBytes ?? 0
   const report = {
     id,
@@ -296,11 +351,13 @@ export async function runAndReport(job, opts) {
     derived: result ? deriveMetrics(result, wallMs) : { conversionMs: wallMs, encodeMs: null, encodeFps: null, realtimeFactor: null, wallMs },
     frames: result?.frames ?? 0,
     encoder: result?.encoder ?? null,
+    audioEncoder: result?.audioEncoder ?? null,
     conversion: result?.conversion,
     mainThread,
     system,
     peakHeapMB: result?.peakHeapMB ?? null,
     memory,
+    visibility,
     verify,
     env,
   }

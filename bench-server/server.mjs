@@ -25,6 +25,7 @@ import { fileURLToPath } from 'node:url'
 import { execFile, execFileSync, spawn } from 'node:child_process'
 import { promisify } from 'node:util'
 import * as P from './probes.mjs'
+import { expiredSessions, overlapSummary, stat } from './stats.mjs'
 
 const execFileP = promisify(execFile)
 let spawnCount = 0 // sampler overhead: child processes started
@@ -376,50 +377,69 @@ let lastFilter = null
 /** pid → footprint (MB) for platforms that measure it separately (Linux PSS) */
 let footprint = new Map()
 
-async function sampleProcesses(rootPid) {
+/**
+ * One process snapshot, then one view per process filter: active sessions from different browsers (two Playwright
+ * runs, or Chrome + Safari) each get their own browser numbers instead of the first session's.
+ * @param {Array<number|null>} rootPids distinct filters (null = name match)
+ */
+async function sampleProcesses(rootPids) {
   const table = await snapshot()
   if (!table) return null
   const { at, procs } = table
-  if (rootPid && !procs.some((p) => p.pid === rootPid)) rootPid = null // that browser has exited
-  lastFilter = rootPid
-  const { selected, mode } = P.selectBrowserProcs(procs, { rootPid, platform: PLATFORM, selfPid: process.pid })
-  const sel = new Set(selected.map((p) => p.pid))
+  const alive = new Set(procs.map((p) => p.pid))
 
+  // CPU % of one core per pid since the previous snapshot
   const next = new Map()
-  const others = []
-  let total = 0
-  let any = false
-  let samplerChildCpu = 0
-  const media = { encoderCpu: null, decoderCpu: null, footprintMB: 0, any: false }
-  const byType = {}
+  const pct = new Map()
   for (const p of procs) {
     next.set(p.pid, { cpu: p.cpu, at, exe: p.exe })
     const prev = lastProc.get(p.pid)
     if (!prev || prev.exe !== p.exe) continue // new process, or a reused pid
     const dt = (at - prev.at) / 1000
     if (dt <= 0) continue
-    const pct = Math.max(0, ((p.cpu - prev.cpu) / dt) * 100)
-    if (P.isMediaService(p.exe)) {
-      media.any = true
-      if (p.exe === 'VTEncoderXPCService') media.encoderCpu = (media.encoderCpu ?? 0) + pct
-      else media.decoderCpu = (media.decoderCpu ?? 0) + pct
-      media.footprintMB += p.footprintMB ?? 0
-    } else if (sel.has(p.pid)) {
-      any = true
-      total += pct
-      const type = P.procType(p.cmd)
-      byType[type] = (byType[type] ?? 0) + pct
-    } else if (p.ppid === process.pid || p.pid === process.pid) {
-      if (p.ppid === process.pid) samplerChildCpu += pct // long-lived probes: procstat, PowerShell, powermetrics
-    } else if (pct >= 1 && !isBrowserExe(p.exe)) others.push({ exe: p.exe, pid: p.pid, pct })
+    pct.set(p.pid, Math.max(0, ((p.cpu - prev.cpu) / dt) * 100))
   }
   lastProc = next
 
+  const views = new Map()
+  for (const r of rootPids) if (!views.has(r)) views.set(r, browserView(procs, pct, r && alive.has(r) ? r : null)) // that browser may have exited
+  const union = new Set()
+  for (const v of views.values()) for (const pid of v.pids) union.add(pid)
+
+  const others = []
+  let samplerChildCpu = 0
+  const media = { encoderCpu: null, decoderCpu: null, footprintMB: 0, any: false }
+  for (const p of procs) {
+    const v = pct.get(p.pid)
+    if (v === undefined) continue
+    if (P.isMediaService(p.exe)) {
+      media.any = true
+      if (p.exe === 'VTEncoderXPCService') media.encoderCpu = (media.encoderCpu ?? 0) + v
+      else media.decoderCpu = (media.decoderCpu ?? 0) + v
+      media.footprintMB += p.footprintMB ?? 0
+    } else if (union.has(p.pid)) continue
+    else if (p.ppid === process.pid) samplerChildCpu += v // long-lived probes: procstat, PowerShell, powermetrics
+    else if (p.pid !== process.pid && v >= 1 && !isBrowserExe(p.exe)) others.push({ exe: p.exe, pid: p.pid, pct: v })
+  }
+  // Linux: PSS every 4th sample (smaps_rollup walks page tables)
+  if (PLATFORM === 'linux' && sampleCount % 4 === 0) void refreshPss(procs.filter((p) => union.has(p.pid)))
+  others.sort((a, b) => b.pct - a.pct)
+  return { views, pids: union, others: others.slice(0, 5), samplerChildCpu, media }
+}
+
+/** CPU / memory of the processes one filter selects (media services are counted separately, never here). */
+function browserView(procs, pct, rootPid) {
+  const { selected, mode } = P.selectBrowserProcs(procs, { rootPid, platform: PLATFORM, selfPid: process.pid })
+  let total = 0
+  let any = false
+  const byType = {}
   let rss = 0
   let fp = 0
   let fpCount = 0
   let priv = 0
+  const pids = new Set()
   for (const p of selected) {
+    pids.add(p.pid)
     rss += p.rssKB
     if (p.privateKB !== undefined) priv += p.privateKB
     const f = p.footprintMB ?? footprint.get(p.pid)
@@ -427,23 +447,23 @@ async function sampleProcesses(rootPid) {
       fp += f
       fpCount++
     }
+    const v = pct.get(p.pid)
+    if (v === undefined || P.isMediaService(p.exe)) continue
+    any = true
+    total += v
+    const type = P.procType(p.cmd)
+    byType[type] = (byType[type] ?? 0) + v
   }
-  // Linux: PSS every 4th sample (smaps_rollup walks page tables), Windows: private bytes
-  if (PLATFORM === 'linux' && sampleCount % 4 === 0) void refreshPss(selected)
-  const footprintMB = PLATFORM === 'win32' ? priv / 1024 : fpCount ? fp : null
-  others.sort((a, b) => b.pct - a.pct)
   return {
+    rootPid,
     total: any ? total : null,
     byType,
     rssMB: rss / 1024,
-    footprintMB,
+    footprintMB: PLATFORM === 'win32' ? priv / 1024 : fpCount ? fp : null, // Windows: private bytes
     footprintCoverage: PLATFORM === 'win32' ? 1 : selected.length ? fpCount / selected.length : null,
     count: selected.length,
     mode,
-    pids: sel,
-    others: others.slice(0, 5),
-    samplerChildCpu,
-    media,
+    pids,
   }
 }
 
@@ -646,23 +666,29 @@ async function sample() {
   }
 }
 
+let lastSampleAt = null
+
+/** Sessions still collecting samples: started, and not past their job-end mark. */
+const collecting = () => [...sessions.values()].filter((x) => !x.end && !x.sampleEnd)
+
 async function takeSample() {
-  const active = [...sessions.values()].filter((s) => !s.end)
-  // Between jobs keep the last tree (so `recent` is comparable); during jobs, exactly what the session says.
-  const rootPid = active.find((s) => s.rootPid)?.rootPid ?? (active.length ? null : lastFilter)
-  const proc = await sampleProcesses(rootPid)
+  const active = collecting()
+  // Each distinct browser filter of the running sessions; between jobs keep the last tree (so `recent` is comparable).
+  const roots = active.length ? [...new Set(active.map((x) => x.rootPid ?? null))] : [lastFilter]
+  const proc = await sampleProcesses(roots)
+  const primary = proc?.views.get(roots[0]) ?? null
+  lastFilter = primary?.rootPid ?? null
   const [gpu, raplW] = await Promise.all([sampleGpu(proc?.pids), sampleRapl()])
-  const s = {
-    t: Date.now(),
+  const t = Date.now()
+  // the interval this sample's CPU deltas cover (they're measured since the previous sample)
+  const dtMs = lastSampleAt === null ? INTERVAL : t - lastSampleAt
+  lastSampleAt = t
+  const system = {
+    t,
+    dtMs,
     cpuSystemPct: systemCpuPct(),
-    browserCpuPct: proc?.total ?? null,
-    browserCpuByType: proc?.byType ?? {},
-    browserRssMB: proc?.rssMB ?? null,
-    browserFootprintMB: proc?.footprintMB ?? null,
-    browserProcs: proc?.count ?? 0,
-    selectMode: proc?.mode ?? null,
-    others: proc?.others ?? [],
     samplerChildCpu: proc?.samplerChildCpu ?? 0,
+    others: proc?.others ?? [],
     // VideoToolbox encode/decode services (all clients: not attributable to one browser)
     mediaEncoderCpuPct: proc?.media?.encoderCpu ?? null,
     mediaDecoderCpuPct: proc?.media?.decoderCpu ?? null,
@@ -672,7 +698,7 @@ async function takeSample() {
     gpuTilerPct: gpu?.tiler ?? null,
     gpuEncoderPct: gpu?.encoder ?? null,
     gpuDecoderPct: gpu?.decoder ?? null,
-    gpuBrowserPct: gpu?.browser3d ?? (PROCESS_GPU ? powermetricsBrowserGpu(proc?.pids) : null),
+    // per-process GPU (Windows counters) is summed over every sampled browser
     gpuBrowserEncoderPct: gpu?.browserEncoder ?? null,
     browserGpuMemMB: gpu?.browserGpuMemMB ?? null,
     gpuCount: gpu?.gpus ?? null,
@@ -682,10 +708,26 @@ async function takeSample() {
     // Apple Silicon CPU clusters from powermetrics: {E: {mhz, activePct}, P: {...}} (P0/P1 on Max chips)
     cpuClusters: power.ok && Object.keys(power.clusters).length ? structuredClone(power.clusters) : null,
   }
+  const withBrowser = (v) => ({
+    ...system,
+    browserCpuPct: v?.total ?? null,
+    browserCpuByType: v?.byType ?? {},
+    browserRssMB: v?.rssMB ?? null,
+    browserFootprintMB: v?.footprintMB ?? null,
+    browserProcs: v?.count ?? 0,
+    selectMode: v?.mode ?? null,
+    gpuBrowserPct: gpu?.browser3d ?? (PROCESS_GPU ? powermetricsBrowserGpu(v?.pids) : null),
+  })
+  const s = withBrowser(primary)
+  const perRoot = new Map([[roots[0], s]])
   latest = s
   recent.push(s)
   if (recent.length > BASELINE_SAMPLES) recent.shift()
-  for (const sess of active) sess.samples.push(s)
+  for (const sess of active) {
+    const key = sess.rootPid ?? null
+    if (!perRoot.has(key)) perRoot.set(key, withBrowser(proc?.views.get(key)))
+    sess.samples.push(perRoot.get(key))
+  }
   sampleCount++
   if (!QUIET && active.length && sampleCount % Math.max(1, Math.round(1000 / INTERVAL)) === 0) {
     const f = (v, suf = '%') => (v === null || v === undefined ? '  —' : `${v.toFixed(0).padStart(3)}${suf}`)
@@ -696,7 +738,8 @@ async function takeSample() {
       .join(' ')
     const pw = s.gpuPowerW !== null ? ` | GPU ${s.gpuPowerW.toFixed(1)}W CPU ${s.cpuPowerW?.toFixed(1) ?? '—'}W` : ''
     const mem = s.browserFootprintMB !== null ? `footprint ${(s.browserFootprintMB / 1024).toFixed(2)} GB` : `RSS ${s.browserRssMB ? (s.browserRssMB / 1024).toFixed(2) : '—'} GB`
-    console.log(`[${active[0].label.slice(0, 40).padEnd(40)}] CPU sys ${f(s.cpuSystemPct)} | browser ${f(s.browserCpuPct)} (${types}) | GPU ${f(s.gpuDevicePct)}${pw} | ${mem}`)
+    const more = active.length > 1 ? ` (+${active.length - 1} more job${active.length > 2 ? 's' : ''})` : ''
+    console.log(`[${active[0].label.slice(0, 40).padEnd(40)}] CPU sys ${f(s.cpuSystemPct)} | browser ${f(s.browserCpuPct)} (${types}) | GPU ${f(s.gpuDevicePct)}${pw} | ${mem}${more}`)
   }
 }
 setInterval(() => {
@@ -706,23 +749,12 @@ void sample()
 
 // ------------------------------------------------------------------ summaries
 
-function stat(values) {
-  const v = values.filter((x) => typeof x === 'number' && Number.isFinite(x))
-  if (!v.length) return null
-  const sorted = [...v].sort((a, b) => a - b)
-  return {
-    avg: v.reduce((a, b) => a + b, 0) / v.length,
-    p95: sorted[Math.min(sorted.length - 1, Math.floor(sorted.length * 0.95))],
-    max: sorted[sorted.length - 1],
-  }
-}
-
 /** Per-cluster stats of active frequency (MHz) and active residency (%) over a job's samples. */
-function clusterStats(samples) {
+function clusterStats(samples, weights) {
   const names = new Set(samples.flatMap((x) => Object.keys(x.cpuClusters ?? {})))
   if (!names.size) return null
   const out = {}
-  for (const n of names) out[n] = { mhz: stat(samples.map((x) => x.cpuClusters?.[n]?.mhz)), activePct: stat(samples.map((x) => x.cpuClusters?.[n]?.activePct)) }
+  for (const n of names) out[n] = { mhz: stat(samples.map((x) => x.cpuClusters?.[n]?.mhz), weights), activePct: stat(samples.map((x) => x.cpuClusters?.[n]?.activePct), weights) }
   return out
 }
 
@@ -748,39 +780,48 @@ function memoryMethod() {
 
 function summarize(sess) {
   const s = sess.samples
+  // averages are weighted by each sample's interval, so a short forced sample (job start/end) counts for what it covers
+  const weights = s.map((x) => x.dtMs)
+  const wstat = (values) => stat(values, weights)
   const types = new Set(s.flatMap((x) => Object.keys(x.browserCpuByType)))
   const byType = {}
-  for (const t of types) byType[t] = stat(s.map((x) => x.browserCpuByType[t] ?? 0))
+  for (const t of types) byType[t] = wstat(s.map((x) => x.browserCpuByType[t] ?? 0))
   const durationMs = (sess.end ?? Date.now()) - sess.start
   const cpu = sess.cpuEnd ?? process.cpuUsage(sess.cpuStart)
   const serverCpuPct = durationMs > 0 ? ((cpu.user + cpu.system) / 1000 / durationMs) * 100 : null
-  const childCpu = stat(s.map((x) => x.samplerChildCpu))
+  const childCpu = wstat(s.map((x) => x.samplerChildCpu))
   return {
     label: sess.label,
     durationMs,
     samples: s.length,
     intervalMs: INTERVAL,
-    cpuSystemPct: stat(s.map((x) => x.cpuSystemPct)),
-    browserCpuPct: stat(s.map((x) => x.browserCpuPct)),
+    // time the samples cover (Σ intervals): from session start to the job-end mark when the client sends one
+    sampledMs: weights.reduce((a, b) => a + (b ?? 0), 0),
+    sampleWindow: sess.sampleEnd ? 'session start → job-end mark' : sess.orphaned ? 'session start → expiry (orphaned)' : 'session start → stop',
+    averaging: 'time-weighted by sample interval (p95/max per sample)',
+    overlap: overlapSummary(sess, sess.end ?? Date.now()),
+    orphaned: sess.orphaned ? { lastSeenMsAgo: Date.now() - sess.lastSeen, timeoutMs: SESSION_TIMEOUT_MS } : null,
+    cpuSystemPct: wstat(s.map((x) => x.cpuSystemPct)),
+    browserCpuPct: wstat(s.map((x) => x.browserCpuPct)),
     browserCpuByType: byType,
-    browserRssMB: stat(s.map((x) => x.browserRssMB)),
-    browserFootprintMB: stat(s.map((x) => x.browserFootprintMB)),
-    browserGpuMemMB: stat(s.map((x) => x.browserGpuMemMB)),
-    mediaEncoderCpuPct: stat(s.map((x) => x.mediaEncoderCpuPct)),
-    mediaDecoderCpuPct: stat(s.map((x) => x.mediaDecoderCpuPct)),
-    mediaServiceFootprintMB: stat(s.map((x) => x.mediaServiceFootprintMB)),
-    gpuDevicePct: stat(s.map((x) => x.gpuDevicePct)),
-    gpuRendererPct: stat(s.map((x) => x.gpuRendererPct)),
-    gpuTilerPct: stat(s.map((x) => x.gpuTilerPct)),
-    gpuEncoderPct: stat(s.map((x) => x.gpuEncoderPct)),
-    gpuDecoderPct: stat(s.map((x) => x.gpuDecoderPct)),
-    gpuBrowserPct: stat(s.map((x) => x.gpuBrowserPct)),
-    gpuBrowserEncoderPct: stat(s.map((x) => x.gpuBrowserEncoderPct)),
+    browserRssMB: wstat(s.map((x) => x.browserRssMB)),
+    browserFootprintMB: wstat(s.map((x) => x.browserFootprintMB)),
+    browserGpuMemMB: wstat(s.map((x) => x.browserGpuMemMB)),
+    mediaEncoderCpuPct: wstat(s.map((x) => x.mediaEncoderCpuPct)),
+    mediaDecoderCpuPct: wstat(s.map((x) => x.mediaDecoderCpuPct)),
+    mediaServiceFootprintMB: wstat(s.map((x) => x.mediaServiceFootprintMB)),
+    gpuDevicePct: wstat(s.map((x) => x.gpuDevicePct)),
+    gpuRendererPct: wstat(s.map((x) => x.gpuRendererPct)),
+    gpuTilerPct: wstat(s.map((x) => x.gpuTilerPct)),
+    gpuEncoderPct: wstat(s.map((x) => x.gpuEncoderPct)),
+    gpuDecoderPct: wstat(s.map((x) => x.gpuDecoderPct)),
+    gpuBrowserPct: wstat(s.map((x) => x.gpuBrowserPct)),
+    gpuBrowserEncoderPct: wstat(s.map((x) => x.gpuBrowserEncoderPct)),
     gpuCount: s.find((x) => x.gpuCount)?.gpuCount ?? null,
-    gpuPowerW: stat(s.map((x) => x.gpuPowerW)),
-    cpuPowerW: stat(s.map((x) => x.cpuPowerW)),
-    gpuFreqMHz: stat(s.map((x) => x.gpuFreqMHz)),
-    cpuClusters: clusterStats(s),
+    gpuPowerW: wstat(s.map((x) => x.gpuPowerW)),
+    cpuPowerW: wstat(s.map((x) => x.cpuPowerW)),
+    gpuFreqMHz: wstat(s.map((x) => x.gpuFreqMHz)),
+    cpuClusters: clusterStats(s, weights),
     processFilter: sess.rootPid ? `process tree of pid ${sess.rootPid}` : 'all browser processes (name match)',
     // how each number was obtained, so weak runs can be filtered out
     method: {
@@ -826,7 +867,7 @@ if (PLATFORM === 'darwin') {
 // ------------------------------------------------------------------ export records (persisted)
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..')
-const RESULTS_DIR = path.join(ROOT, 'bench-results')
+const RESULTS_DIR = process.env.BENCH_RESULTS_DIR ? path.resolve(process.env.BENCH_RESULTS_DIR) : path.join(ROOT, 'bench-results') // tests use a temp dir
 const RECORDS_FILE = path.join(RESULTS_DIR, 'exports.jsonl')
 const DASHBOARD_FILE = path.join(path.dirname(fileURLToPath(import.meta.url)), 'dashboard.html')
 mkdirSync(RESULTS_DIR, { recursive: true })
@@ -919,6 +960,39 @@ setInterval(() => {
   for (const [id, s] of finished) if (s.end < cutoff) finished.delete(id)
 }, 60_000)
 
+/**
+ * A session whose page stopped talking (tab closed, reloaded or crashed mid-job) would otherwise collect samples
+ * forever, stay "running" in the Live view, and steer the process filter. Running jobs post main-thread buckets
+ * every 500 ms (≥ 1/min even in a throttled background tab), so silence this long means the page is gone.
+ */
+const SESSION_TIMEOUT_MS = Math.max(1000, Number(process.env.BENCH_SESSION_TIMEOUT_MS) || 180_000)
+setInterval(
+  () => {
+    for (const id of expiredSessions(sessions, Date.now(), SESSION_TIMEOUT_MS)) {
+      const sess = sessions.get(id)
+      sess.orphaned = true
+      sess.samples = sess.samples.filter((x) => x.t <= sess.lastSeen + INTERVAL) // nothing after the page went quiet
+      endSampling(id, sess, sess.lastSeen)
+      sess.end = sess.lastSeen
+      sess.cpuEnd = process.cpuUsage(sess.cpuStart)
+      sessions.delete(id)
+      finished.set(id, sess)
+      console.warn(`⚠ ${sess.meta.kind ?? 'job'} ${id} expired: no request for ${Math.round(SESSION_TIMEOUT_MS / 1000)} s (page closed or crashed?). Sampling stopped; if the page still reports, the record is saved marked orphaned.`)
+    }
+  },
+  Math.min(5000, SESSION_TIMEOUT_MS / 2),
+)
+
+/** Stop a session's sampling at `at` and close its overlap intervals (on both sides). */
+function endSampling(id, sess, at = Date.now()) {
+  sess.sampleEnd ??= at
+  for (const oid of sess.overlaps.keys()) {
+    const other = sessions.get(oid) ?? finished.get(oid)
+    const entry = other?.overlaps.get(id)
+    if (entry && entry.to === null) entry.to = at
+  }
+}
+
 function activeJobs() {
   return [...sessions.entries()]
     .filter(([, s]) => !s.end)
@@ -1002,6 +1076,9 @@ const server = http.createServer(async (req, res) => {
         attribution = { method: r.safari ? 'safari-webkit' : r.ambiguous ? 'page-port-ambiguous' : 'socket', rootPid, browser: r.browser, via: r.via }
       } else attribution = { method: 'name-match', rootPid: null, via: r?.via ?? 'no connection found: all processes whose executable is a known browser' }
     }
+    // This sample's CPU deltas cover the time BEFORE the job, so it closes the idle baseline instead of opening the
+    // session: the session's first sample then covers exactly [start, first tick].
+    await sample()
     const base = (k) => stat(recent.map((x) => x[k]))?.avg ?? null
     const baseline = {
       samples: recent.length,
@@ -1011,12 +1088,18 @@ const server = http.createServer(async (req, res) => {
       cpuPowerW: base('cpuPowerW'),
       backgroundLoad: backgroundLoad(recent), // busiest non-browser processes just before the job
     }
-    const sess = { label: String(label ?? `job ${id}`), rootPid, attribution, baseline, meta, start: Date.now(), samples: [], marks: [], mainThread: [], progress: [], cpuStart: process.cpuUsage(), spawnStart: spawnCount }
+    const now = Date.now()
+    const sess = { label: String(label ?? `job ${id}`), rootPid, attribution, baseline, meta, start: now, lastSeen: now, samples: [], marks: [], mainThread: [], progress: [], overlaps: new Map(), cpuStart: process.cpuUsage(), spawnStart: spawnCount }
     // power source / thermal state: read in the background so the job doesn't wait for it
     sess.conditionsP = runConditions().then((c) => (sess.conditions = c))
+    // jobs sampled at the same time share system CPU/GPU numbers: flag them on both sides
+    for (const [oid, o] of sessions) {
+      if (o.end || o.sampleEnd) continue
+      o.overlaps.set(id, { label: sess.label, rootPid, from: now, to: null })
+      sess.overlaps.set(oid, { label: o.label, rootPid: o.rootPid, from: now, to: null })
+    }
     sessions.set(id, sess)
-    if (!QUIET) console.log(`▶ ${meta.kind ?? 'job'} ${id} start: ${label ?? ''} · browser: ${attribution.via}`)
-    await sample()
+    if (!QUIET) console.log(`▶ ${meta.kind ?? 'job'} ${id} start: ${label ?? ''} · browser: ${attribution.via}${sess.overlaps.size ? ` · ⚠ overlaps ${sess.overlaps.size} running job(s)` : ''}`)
     return send(res, 200, { id })
   }
   m = /^\/sessions\/(\w+)\/(mark|stop|progress|mainthread|report)$/.exec(p)
@@ -1025,10 +1108,19 @@ const server = http.createServer(async (req, res) => {
     const sess = sessions.get(id) ?? finished.get(id)
     if (!sess) return send(res, 404, { error: 'no such session' })
     const body = await readBody(req)
+    if (!sess.end) sess.lastSeen = Date.now()
     switch (m[2]) {
-      case 'mark':
-        sess.marks.push({ name: String(body.name ?? ''), t: Date.now() - sess.start })
+      case 'mark': {
+        const name = String(body.name ?? '')
+        sess.marks.push({ name, t: Date.now() - sess.start })
+        // job-end: one last sample covering the job's final moments, then no more (the client still has to
+        // collect its main-thread stats, verify the output and report; none of that is the job)
+        if (name === 'job-end' && !sess.end && !sess.sampleEnd) {
+          await sample()
+          endSampling(id, sess)
+        }
         return send(res, 200, { ok: true })
+      }
       case 'progress':
         sess.progress.push({ t: Date.now(), progress: Number(body.progress) || 0, processedTime: Number(body.processedTime) || 0 })
         return send(res, 200, { ok: true })
@@ -1037,7 +1129,8 @@ const server = http.createServer(async (req, res) => {
         return send(res, 200, { ok: true })
       case 'stop': {
         if (!sess.end) {
-          await sample()
+          if (!sess.sampleEnd) await sample() // older clients send no job-end mark
+          endSampling(id, sess)
           sess.end = Date.now()
           sess.cpuEnd = process.cpuUsage(sess.cpuStart)
           sessions.delete(id)

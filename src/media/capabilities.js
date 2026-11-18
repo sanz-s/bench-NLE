@@ -1,6 +1,6 @@
 import { getEncodableAudioCodecs, getEncodableVideoCodecs } from 'mediabunny'
 import { CONTAINERS, VIDEO_CODEC_LABELS, audioCodecLabel } from './formats'
-import { EXTENSION_CODECS, registerAllExtensions } from './extensions'
+import { EXTENSION_CODECS, prepareAacEncoder, registerAllExtensions } from './extensions'
 
 const cache = new Map()
 
@@ -20,6 +20,8 @@ export function getCapabilities(q) {
 
 async function computeCapabilities(q) {
   registerAllExtensions()
+  // default AAC mode: native when the browser has it, otherwise the WASM extension (so AAC is always listed)
+  const aac = await prepareAacEncoder('auto')
   const result = []
   for (const def of CONTAINERS) {
     if (!def.make) {
@@ -53,7 +55,7 @@ async function computeCapabilities(q) {
         codec,
         label: audioCodecLabel(codec),
         available,
-        viaExtension: EXTENSION_CODECS[codec],
+        viaExtension: codec === 'aac' ? (aac.impl === 'wasm-extension' ? EXTENSION_CODECS.aac : undefined) : EXTENSION_CODECS[codec],
         reason: available ? undefined : `This browser can't encode ${audioCodecLabel(codec)} (${q.channels} ch, ${q.sampleRate} Hz).`,
       }
     })

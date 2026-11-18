@@ -37,6 +37,8 @@ export function flattenReport(r) {
     hwAccel: r.settings.hardwareAcceleration,
     encoderCodec: r.encoder?.videoEncoderConfig?.codec ?? null,
     encoderHw: r.encoder?.videoEncoderConfig?.hardwareAcceleration ?? null,
+    audioEncoderImpl: r.audioEncoder?.impl ?? null,
+    aacRequested: r.audioEncoder?.requested ?? null,
     copyVideo: r.conversion?.copyExpected.video ?? null,
     copyAudio: r.conversion?.copyExpected.audio ?? null,
     frames: r.frames,
@@ -78,11 +80,14 @@ export function flattenReport(r) {
     gpuPowerAvgW: round(r.system?.gpuPowerW?.avg, 2),
     cpuPowerAvgW: round(r.system?.cpuPowerW?.avg, 2),
     browserRssMaxMB: round(r.system?.browserRssMB?.max),
+    tabHiddenMs: round(r.visibility?.hiddenMs),
+    sysWindowMs: round(r.system?.sampledMs),
+    overlappingJobs: r.system?.overlap?.sessions?.length ?? null,
     verified: r.verify?.ok ?? null,
     verifyProblems: r.verify?.problems.join(' | ') ?? null,
     error: r.error ?? null,
   }
-  if (r.cdp) for (const [k, v] of Object.entries(r.cdp)) row[`cdp_${k}`] = round(v, 1)
+  if (r.cdp) for (const [k, v] of Object.entries(r.cdp)) row[`cdp_${k}`] = typeof v === 'number' ? round(v, 1) : v
   return row
 }
 

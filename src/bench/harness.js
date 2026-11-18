@@ -18,8 +18,15 @@ import { installMainThreadObservers, startMainThreadWindow } from './mainThread'
 import { runAndReport, verifyOutput } from './jobRunner'
 import { probeFile } from '../media/probe'
 
+/** Scenario settings. The AAC encoder under test comes from `bench/run.mjs --aac` (localStorage) unless the patch sets it. */
 function settingsFor(base, patch) {
-  return { ...base, ...patch }
+  let aac = null
+  try {
+    aac = localStorage.getItem('bench.aacEncoder')
+  } catch {
+    /* no storage */
+  }
+  return { ...base, ...(aac ? { aacEncoder: aac } : {}), ...patch }
 }
 
 function releaseOutput(reportId) {

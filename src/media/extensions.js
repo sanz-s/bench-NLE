@@ -8,7 +8,7 @@ import { registerTrueHdDecoder, registerTrueHdEncoder } from '@mediabunny/truehd
 
 /** Which codecs are provided by extension packages rather than native WebCodecs. */
 export const EXTENSION_CODECS = {
-  aac: '@mediabunny/aac-encoder (encode polyfill)',
+  aac: '@mediabunny/aac-encoder (FFmpeg WASM; only when chosen or the browser has no native AAC)',
   mp3: '@mediabunny/mp3-encoder (LAME)',
   flac: '@mediabunny/flac-encoder (libFLAC)',
   prores: '@mediabunny/prores (decode only)',
@@ -21,15 +21,13 @@ export const EXTENSION_CODECS = {
 let registered = false
 
 /**
- * Registers every official Mediabunny extension. Registration is per JS context,
- * so this must run in the main thread AND in every worker that uses Mediabunny.
- * Safe to call repeatedly.
+ * Registers every official Mediabunny extension except the AAC encoder (see prepareAacEncoder). Registration is per
+ * JS context, so this must run in the main thread AND in every worker that uses Mediabunny. Safe to call repeatedly.
  */
 export function registerAllExtensions() {
   if (registered) return
   registered = true
   const steps = [
-    ['aac-encoder', registerAacEncoder],
     ['mp3-encoder', registerMp3Encoder],
     ['flac-encoder', registerFlacEncoder],
     ['prores-decoder', registerProresDecoder],
@@ -47,4 +45,61 @@ export function registerAllExtensions() {
       console.warn(`[mediabunny] failed to register ${name}`, err)
     }
   }
+}
+
+// ------------------------------------------------------------------ AAC: native WebCodecs or the WASM extension
+
+/**
+ * Mediabunny tries registered custom encoders BEFORE native WebCodecs, and the WASM AAC encoder accepts every AAC
+ * config we use. Registering it unconditionally would make every AAC benchmark measure FFmpeg-in-WASM (in its own
+ * nested worker) instead of the browser's encoder. So it's registered per context, by mode:
+ *   'auto'   — only when the browser has no native AAC encoder (the extension's documented usage; default)
+ *   'native' — never (fails if the browser has no AAC encoder)
+ *   'wasm'   — always
+ * A registration can't be undone, so in a long-lived context (the main thread) a 'wasm' job keeps WASM for later
+ * jobs too; the returned state says so. Workers are created per job, so worker jobs always get exactly their mode.
+ */
+export const AAC_MODES = ['auto', 'native', 'wasm']
+let aacRegistered = false
+let nativeAacP = null
+
+/** Whether this browser can encode AAC through WebCodecs (48 kHz stereo 128 kb/s). Cached per context. */
+export function nativeAacSupported() {
+  nativeAacP ??=
+    typeof AudioEncoder === 'undefined'
+      ? Promise.resolve(false)
+      : AudioEncoder.isConfigSupported({ codec: 'mp4a.40.2', sampleRate: 48000, numberOfChannels: 2, bitrate: 128000 })
+          .then((r) => r.supported === true)
+          .catch(() => false)
+  return nativeAacP
+}
+
+/** Registers (or not) the WASM AAC encoder for `mode` and returns which implementation AAC jobs here will use. */
+export async function prepareAacEncoder(mode = 'auto') {
+  if (!AAC_MODES.includes(mode)) mode = 'auto'
+  const native = await nativeAacSupported()
+  if (!aacRegistered && (mode === 'wasm' || (mode === 'auto' && !native))) {
+    try {
+      registerAacEncoder()
+      aacRegistered = true
+    } catch (err) {
+      console.warn('[mediabunny] failed to register aac-encoder', err)
+    }
+  }
+  const impl = aacRegistered ? 'wasm-extension' : native ? 'native-webcodecs' : 'unavailable'
+  return {
+    requested: mode,
+    impl,
+    nativeAvailable: native,
+    note: mode === 'native' && aacRegistered ? 'the WASM encoder was already registered in this JS context by an earlier job (main thread); reload the page to measure native AAC on the main thread' : undefined,
+  }
+}
+
+/** Which implementation encodes `codec` in this context (after prepareAacEncoder for AAC). */
+export function audioEncoderImpl(codec, aac) {
+  if (!codec) return null
+  if (codec === 'aac') return aac?.impl ?? (aacRegistered ? 'wasm-extension' : 'native-webcodecs')
+  if (codec.startsWith('pcm-') || codec === 'ulaw' || codec === 'alaw') return 'mediabunny-pcm'
+  if (EXTENSION_CODECS[codec]) return 'wasm-extension'
+  return 'native-webcodecs'
 }

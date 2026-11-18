@@ -12,7 +12,7 @@ import {
   QUALITY_VERY_LOW,
   StreamTarget,
 } from 'mediabunny'
-import { registerAllExtensions } from './extensions'
+import { audioEncoderImpl, prepareAacEncoder, registerAllExtensions } from './extensions'
 import { containerDef, makeOutputFormat } from './formats'
 import { openInput } from './probe'
 import { VideoReader, containSize } from './videoReader'
@@ -49,16 +49,31 @@ class HeapTracker {
   }
 }
 
-export function runJob(job, hooks = {}) {
+export async function runJob(job, hooks = {}) {
   registerAllExtensions()
+  const codec = job.kind === 'fixture' ? job.spec?.audioCodec : job.settings?.audioCodec
+  // AAC: native WebCodecs or the WASM extension, decided per job (see prepareAacEncoder)
+  const aac = await prepareAacEncoder(job.settings?.aacEncoder ?? 'auto')
+  let result
   switch (job.kind) {
     case 'export':
-      return runExport(job, hooks)
+      result = await runExport(job, hooks)
+      break
     case 'convert':
-      return job.engine === 'conversion' ? runConversion(job, hooks) : runPipelineConvert(job, hooks)
+      result = await (job.engine === 'conversion' ? runConversion(job, hooks) : runPipelineConvert(job, hooks))
+      break
     case 'fixture':
       return runFixture(job)
   }
+  const copied = result.conversion?.copyExpected?.audio === true
+  result.audioEncoder = codec
+    ? {
+        codec,
+        impl: copied ? 'copy (not re-encoded)' : audioEncoderImpl(codec, aac),
+        ...(codec === 'aac' ? { requested: aac.requested, nativeAvailable: aac.nativeAvailable, ...(aac.note ? { note: aac.note } : {}) } : {}),
+      }
+    : null
+  return result
 }
 
 // ------------------------------------------------------------------ targets

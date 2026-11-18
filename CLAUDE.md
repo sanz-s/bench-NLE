@@ -20,13 +20,14 @@ A browser-based non-linear video editor (NLE) whose purpose is **benchmarking Me
   - The server stores each job as one record (report + CPU/GPU/main-thread series) in `bench-results/exports.jsonl`.
   - Records carry `source: editor|playwright`. Playwright is detected via `setRootPid`/`setAutomated`.
   - Chart colors follow entities, using the dataviz palette, validated on `#17181b`. Stage bars use 4 fixed groups so any subset keeps valid neighbour pairs.
-- `npm run bench:server`: CPU/GPU sampler for the terminal on :5199. `sudo npm run bench:server -- --powermetrics` adds CPU/GPU power, GPU frequency and Apple Silicon E/P-cluster frequency and active residency (`cpuClusters`). `--process-gpu` (also sudo) adds powermetrics' tasks sampler for per-process GPU time. It's opt-in because it costs ~80 ms/s CPU, and on macOS 26 every task reads 0 GPU ms/s, so the value stays null unless macOS reports it. `npm run test:bench-server` runs the OS-parser fixture tests.
+- `npm run bench:server`: CPU/GPU sampler for the terminal on :5199. `sudo npm run bench:server -- --powermetrics` adds CPU/GPU power, GPU frequency and Apple Silicon E/P-cluster frequency and active residency (`cpuClusters`). `--process-gpu` (also sudo) adds powermetrics' tasks sampler for per-process GPU time. It's opt-in because it costs ~80 ms/s CPU, and on macOS 26 every task reads 0 GPU ms/s, so the value stays null unless macOS reports it. `npm run test:bench-server` runs the OS-parser fixture tests, the summary-stat tests (`stats.test.mjs`) and a session integration test (`sessions.test.mjs`: starts a server on :5299 with a temp results dir).
 - `npm run bench`: builds, starts `vite preview`, drives headed Google Chrome with Playwright through the scenarios in `bench/scenarios.mjs`, and writes `bench-results/*.json|csv`.
   - `npm run bench -- --scenario <id>` runs one scenario.
   - `--runs N` sets the repeat count (median is reported).
   - `--matrix` round-trip-tests every export format/codec combination.
   - `--trace` saves Chrome traces.
   - `--headless` / `--chromium` choose a different browser setup.
+  - `--aac auto|native|wasm` picks the AAC encoder under test (default auto). Each row records `audioEncoderImpl`.
 - `npm run bench:matrix`: round-trips every encodable container × codec (convert, then re-probe).
 - `npm run test:regress`: regression tests for the defects found by the 2026-11-18 audits (`bench/regress.mjs`: fractional audio tails, copy ignoring audio settings, verifier false positives) plus `bench/summary.test.mjs`. Each test failed on the unfixed code.
 - `npm run test:ui`: UI smoke tests through the real UI. `bench/ui-smoke.mjs` covers editing; `bench/effects-smoke.mjs` covers text, stickers, filters, transitions, copy/paste and effects exports. Screenshots go to `bench-results/ui-smoke/` and `bench-results/effects-smoke/`.
@@ -36,6 +37,9 @@ A browser-based non-linear video editor (NLE) whose purpose is **benchmarking Me
 ## Architecture (data flow)
 - `src/media/`: the Mediabunny-only layer, with no React. It runs in both the main thread and the worker.
   - `extensions.js` `registerAllExtensions()` must run once **in every JS context** (main thread and each worker) before any decode or encode.
+    - It registers everything **except the AAC encoder**. Mediabunny tries custom encoders before native WebCodecs, so `prepareAacEncoder(mode)` registers the WASM AAC encoder only for `settings.aacEncoder` = `'wasm'`, or `'auto'` (the default) when the browser has no native AAC. `runJob` calls it for every job.
+    - Each report carries `audioEncoder: { codec, impl: native-webcodecs | wasm-extension | mediabunny-pcm | copy, requested }`.
+    - Workers are created per job, so they always get the requested mode. The main thread can't unregister, so after one `'wasm'` main-thread job, later main-thread jobs also use WASM, and the report says so (`note`).
   - `formats.js` maps container ids to Mediabunny `*OutputFormat` classes.
   - `capabilities.js` builds the format matrix (container → encodable codecs + reasons) that drives the export and convert UI.
   - `probe.js` turns a File into `MediaInfo`.
@@ -63,8 +67,12 @@ A browser-based non-linear video editor (NLE) whose purpose is **benchmarking Me
     2. `socket`: editor exports. The Vite bridge forwards the browser socket's port (`x-bench-peer-port`); `resolveBrowserRoot()` finds the socket's owner (`lsof` on macOS, `/proc/net/tcp` on Linux, `Get-NetTCPConnection` on Windows) and walks up to the browser main process. A WebKit-service owner means Safari (`safari-webkit`: Safari plus all WebKit services). Requests that skip the bridge send `pagePort` instead (`page-port-ambiguous` if several browsers are connected).
     3. `name-match`: fallback. Executable basenames (`BROWSER_EXE_RE` in `probes.mjs`, never whole command lines) plus their descendants.
   - Non-browser children (extension native-messaging hosts, crashpad) are always dropped, except renamed Firefox children on Linux. Firefox child roles (tab, gpu, rdd, socket) map onto Chrome's process types.
-  - Each session stores an idle `baseline` (the ~2 s of samples before it started). `method` also records the CPU, RAM, GPU and power sources. The dashboard detail shows all of them, with a ⚠ for name-match and older records.
-- `bench/run.mjs` is the Playwright runner. It adds CDP `Performance.getMetrics` deltas to each in-app report.
+  - Each session stores an idle `baseline` (the ~2 s of samples before it started; the sample taken when the session opens belongs to the baseline, not the job).
+  - **Sampling window:** session start → the client's `job-end` mark (`jobRunner` sends it right after the job). The server takes one last sample then and ignores later ones, so the main-thread wait, verification and the report never dilute the averages. Each sample carries `dtMs`, and summary averages are **time-weighted** (p95/max per sample). The summary has `sampledMs`, `sampleWindow` and `averaging`.
+  - **Overlap:** sessions sampled at the same time are flagged on both sides (`summary.overlap`), because system CPU/GPU/power are shared. Each session has its own process filter (one snapshot, one view per filter), so another browser's job doesn't steal its numbers.
+  - **Orphans:** a session with no request for `BENCH_SESSION_TIMEOUT_MS` (default 180 s) expires (`summary.orphaned`). Its samples after the last request are dropped, and it leaves the Live view.
+  - `BENCH_RESULTS_DIR` overrides `bench-results/` (used by the tests). `method` also records the CPU, RAM, GPU and power sources. The dashboard detail shows all of them, with a ⚠ for name-match and older records.
+- `bench/run.mjs` is the Playwright runner. It adds CDP `Performance.getMetrics` deltas to each in-app report, covering **the job only**: it exposes `__nleBenchGate`, which `jobRunner` awaits right before and after the job. `cdp.window` is `job`, and `cdp.wholeRunTaskMs` keeps the old whole-evaluate number.
 
 ## Effects (text, stickers, transitions, filters, animations)
 - **Modules:** `src/media/effects/` holds `text.js` (fonts, presets, layout/draw), `stickers.js` (Path2D/emoji library), `filters.js` (presets → `ctx.filter` + overlays for temperature, tint, vignette and grain), `animations.js` (in/out/loop/reveal → per-frame `AnimState`) and `transitions.js` (draw math).
@@ -110,7 +118,8 @@ The `JobReport` shape built in `src/bench/metrics.js` (`deriveMetrics`) and `job
   - `baseline`: idle CPU/GPU and `backgroundLoad` before the job.
   - `conditions`: power source, low-power mode, thermal state.
   - `samplerOverhead`: the server's own CPU, its probes, and spawns per sample.
-  - `report.memory`: main-thread JS heap peak (always on).
+  - `report.memory`: main-thread JS heap peak (always on). It's stopped before output verification.
+  - `report.visibility`: whether the tab was hidden during the job (`hiddenMs`, `changes`, `startedHidden`). A hidden tab throttles timers, rAF and main-thread jobs, so the dashboard flags it ⚠.
   - Page + workers memory via `measureUserAgentSpecificMemory` is opt-in (`localStorage['bench.pageMemory'] = '1'`). Chrome answers at a GC it may trigger mid-export (about 13 s in testing), so it is off by default, and jobs shorter than that get null.
   - CPU baselines are kept for every pid, so the first sample of a job has a value.
 - **CPU/GPU/RAM limits (known):**
@@ -118,6 +127,7 @@ The `JobReport` shape built in `src/bench/metrics.js` (`deriveMetrics`) and `job
   - macOS per-process GPU: powermetrics lists a GPU ms/s column but reports 0.00 for every task on macOS 26 (`--process-gpu` picks it up if that changes).
   - Safari is a WebKit name group, shared with other WebKit apps.
   - Windows paths are untested.
+  - **Native vs WASM AAC sizes differ:** on macOS Chrome the native AAC encoder wrote ~47 kb/s for the synthetic fixture tone, where the WASM encoder wrote ~194 kb/s for the same requested quality (2026-11-18, `bench/regress.mjs` B1). So compare encode speed between the two with output size in mind.
 - **Output verification:** `verifyOutput` (in `jobRunner.js`) re-probes each output and decodes it (`decodeCheck` in `probe.js`).
   - **Checks:** the tracks the job meant to write are present (`result.tracks`); codecs; container (output-format MIME vs re-probed MIME); size; frame rate (±2 %); audio sample rate (except codec-imposed rates, e.g. Opus at 48 kHz) and channels; duration within max(0.15 s, 2 frames).
   - **Decode depth:** by default the first 3 frames and samples **plus the last video frame and the final ~0.25 s of audio**, which catches truncated files. Full decode (every frame and sample, with the frame count and audio length compared) is on for `--matrix`, and opt-in with `--full-verify` or `localStorage['bench.fullVerify'] = '1'`. `verify.depth` records which one ran.

@@ -89,6 +89,7 @@ export function defaultEncodeSettings(p) {
     audioBitrate: 192_000,
     keyFrameInterval: 2,
     hardwareAcceleration: 'no-preference',
+    aacEncoder: 'auto', // 'auto' | 'native' | 'wasm' (see prepareAacEncoder in media/extensions.js)
     audioChannels: 2,
     sampleRate: 48000,
   }

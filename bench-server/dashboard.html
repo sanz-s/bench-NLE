@@ -583,6 +583,21 @@ async function openDetail(id) {
     if (c.thermalWarning === 'none') bits.push('no thermal warning')
     return bits.join(' · ') || '—'
   }
+  // Which audio encoder ran. Before the AAC toggle existed, AAC always went through the WASM extension.
+  const audioEncoderText = (r) => {
+    const a = r.audioEncoder
+    if (!a) return r.settings.audioCodec === 'aac' ? '<span class="warn">⚠ not recorded (older record: AAC then always used the WASM extension)</span>' : '<span class="muted">not recorded (older record)</span>'
+    const names = { 'native-webcodecs': 'browser native (WebCodecs)', 'wasm-extension': 'WASM extension', 'mediabunny-pcm': 'Mediabunny PCM', unavailable: 'unavailable' }
+    let t = esc(names[a.impl] ?? a.impl)
+    if (a.requested) t += ` <span class="muted">· requested ${esc(a.requested)}${a.nativeAvailable === false ? ' · no native AAC here' : ''}</span>`
+    if (a.note) t += ` <span class="warn">⚠ ${esc(a.note)}</span>`
+    return t
+  }
+  // A hidden tab throttles timers and rAF (and main-thread jobs), so such runs aren't comparable.
+  const visibilityText = (v) => {
+    if (!v.hiddenMs && !v.startedHidden && !v.endedHidden) return `visible throughout${v.focusedAtStart === false || v.blurs ? ' <span class="muted">(window not focused at some point)</span>' : ''}`
+    return `<span class="warn">⚠ hidden ${(v.hiddenMs / 1000).toFixed(1)} s (${v.hiddenPct.toFixed(0)} % of the job)${v.startedHidden ? ', started hidden' : ''}: timers, rAF and main-thread jobs are throttled, so main-thread and timing numbers aren’t comparable</span>`
+  }
   // How Chrome CPU / memory were attributed. Name matches and older records may include other browsers' processes.
   const attributionText = (s) => {
     const a = s.method?.attribution
@@ -625,6 +640,7 @@ async function openDetail(id) {
       ${kv('Quality', r.settings.qualityMode === 'level' ? r.settings.quality : `${(r.settings.videoBitrate / 1e6).toFixed(1)} Mb/s`)}
       ${kv('Hardware preference', esc(r.settings.hardwareAcceleration))}
       ${kv('Encoder', esc(enc.videoEncoderConfig?.codec ?? enc.audioEncoderConfig?.codec ?? '—'))}
+      ${r.settings.audioCodec ? kv('Audio encoder', audioEncoderText(r)) : ''}
       ${r.conversion ? kv('Stream copy (predicted)', `video ${yn(r.conversion.copyExpected.video)} · audio ${yn(r.conversion.copyExpected.audio)}`) : ''}
       ${kv('Encoder busy span', fmtMs(enc.encoderSpan))}
       ${kv('Encoder latency max', fmtMs(enc.latencyMax))}
@@ -648,7 +664,10 @@ async function openDetail(id) {
       ${sys.baseline?.backgroundLoad?.length ? kv('Background load before', sys.baseline.backgroundLoad.map((b) => `${esc(b.exe)} ${b.cpuPct.toFixed(0)}%`).join(' · ')) : ''}
       ${sys.samplerOverhead ? kv('Sampler overhead', `server ${fmtPct(sys.samplerOverhead.serverCpuPct, 1)} · probes ${fmtPct(sys.samplerOverhead.probeCpuPct, 1)} of a core · ${sys.samplerOverhead.spawnsPerSample?.toFixed(1) ?? '—'} spawns/sample`) : ''}
       ${/HeadlessChrome/.test(r.env?.userAgent ?? '') ? kv('Browser mode', '<span class="warn">⚠ headless: GPU / encoder numbers may be software fallbacks</span>') : ''}
-      ${kv('Recorded samples', `${rec.series.samples.length} CPU/GPU · ${rec.series.mainThread.length} main-thread`)}
+      ${r.visibility ? kv('Tab visibility', visibilityText(r.visibility)) : kv('Tab visibility', '<span class="muted">not recorded (older record)</span>')}
+      ${sys.overlap ? kv('Overlapping jobs', `<span class="warn">⚠ ${esc(sys.overlap.note)}</span> ${sys.overlap.sessions.map((o) => `${esc(o.label)} (${(o.overlapMs / 1000).toFixed(1)} s)`).join(' · ')}`) : ''}
+      ${sys.orphaned ? kv('Session', '<span class="warn">⚠ expired: the page stopped responding mid-job</span>') : ''}
+      ${kv('Recorded samples', `${rec.series.samples.length} CPU/GPU · ${rec.series.mainThread.length} main-thread${sys.sampledMs != null ? ` · ${(sys.sampledMs / 1000).toFixed(2)} s sampled (${esc(sys.sampleWindow)}), time-weighted averages` : ' · <span class="muted">unweighted averages (older record)</span>'}`)}
     </dl>`
   $('#close-detail').onclick = () => {
     openId = null

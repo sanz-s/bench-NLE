@@ -7,6 +7,8 @@
  *   F1  exports whose range ends between two audio samples used to hang (audio cursor never advanced)
  *   F2  stream-copy conversion ignored the requested audio sample rate / channel count
  *   F3  the output verifier passed files with the wrong audio config, a missing audio track, or a truncated tail
+ *   B1  AAC always ran on the WASM extension (never the browser's encoder), and reports didn't say which ran
+ *   B2  a hidden tab during a job was not recorded
  *
  * A hang is detected with a hard timeout; the browser context is then closed (a stuck worker can't be cancelled).
  */
@@ -176,6 +178,55 @@ for (const runIn of ['worker', 'main']) {
     }),
   )
   record('F3 verifier rejects a truncated MP4 (and still accepts the intact one)', r !== 'TIMEOUT' && r.intactOk === true && r.cutOk === false, JSON.stringify(r))
+}
+
+// ---------------------------------------------------------------- B1: AAC encoder choice is real and recorded
+{
+  const r = await withTimeout(90000, (page) =>
+    page.evaluate(async () => {
+      const id = await window.__nleBench.generateFixture({ width: 640, height: 360, duration: 3, fps: 30 })
+      window.__nleBench.buildTestTimeline(id)
+      const hasNative = typeof AudioEncoder !== 'undefined' && (await AudioEncoder.isConfigSupported({ codec: 'mp4a.40.2', sampleRate: 48000, numberOfChannels: 2, bitrate: 128000 })).supported
+      const out = { hasNative }
+      for (const mode of hasNative ? ['native', 'wasm', 'auto'] : ['wasm', 'auto']) {
+        const rep = await window.__nleBench.exportRange({ start: 0, end: 3 }, { container: 'mp4', videoCodec: null, audioCodec: 'aac', aacEncoder: mode }, { runIn: 'worker' })
+        out[mode] = { status: rep.status, impl: rep.audioEncoder?.impl, ok: rep.verify?.ok, bytes: rep.output.bytes }
+      }
+      return out
+    }),
+  )
+  const want = (m, impl) => r[m]?.status === 'done' && r[m].ok === true && r[m].impl === impl
+  const ok =
+    r !== 'TIMEOUT' &&
+    want('wasm', 'wasm-extension') &&
+    (r.hasNative
+      ? want('native', 'native-webcodecs') && want('auto', 'native-webcodecs') && r.native.bytes !== r.wasm.bytes // different encoders → different bitstreams
+      : want('auto', 'wasm-extension'))
+  record('B1 AAC native vs WASM is selectable, actually changes the encoder, and is recorded', ok, JSON.stringify(r))
+}
+
+// ---------------------------------------------------------------- B2: tab visibility is recorded
+{
+  const r = await withTimeout(45000, (page) =>
+    page.evaluate(async () => {
+      // simulate the user switching tabs mid-job (headless tabs never become hidden on their own)
+      let vis = 'visible'
+      Object.defineProperty(document, 'visibilityState', { configurable: true, get: () => vis })
+      const flip = (v) => {
+        vis = v
+        document.dispatchEvent(new Event('visibilitychange'))
+      }
+      const id = await window.__nleBench.generateFixture({ width: 640, height: 360, duration: 4, fps: 30 })
+      window.__nleBench.buildTestTimeline(id)
+      setTimeout(() => flip('hidden'), 50)
+      setTimeout(() => flip('visible'), 350)
+      const rep = await window.__nleBench.exportRange({ start: 0, end: 4 }, { container: 'mp4', videoCodec: 'avc', audioCodec: 'aac', width: 640, height: 360 }, { runIn: 'worker' })
+      return { wallMs: rep.derived.wallMs, visibility: rep.visibility }
+    }),
+  )
+  const v = r?.visibility
+  const ok = r !== 'TIMEOUT' && v && v.changes === 2 && v.hiddenMs > 200 && v.hiddenMs < 500 && v.startedHidden === false && v.endedHidden === false
+  record('B2 a tab hidden mid-job is recorded (≈300 ms hidden)', ok, JSON.stringify(r))
 }
 
 await browser.close()
