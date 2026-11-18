@@ -8,6 +8,9 @@
  *   npm run bench -- --matrix                       # round-trip every encodable container/codec pair
  *   npm run bench -- --url http://localhost:5173    # use an already running dev server
  *   flags: --headless  --chromium (bundled Chromium instead of installed Chrome)  --out bench-results
+ *          --full-verify (decode every frame/sample of each output; default for --matrix, --quick-verify turns it off)
+ *          --fail-on-skip (unsupported scenarios also fail the run)
+ * Medians use only runs that finished AND passed output verification. Exit code is 1 if any run failed.
  *
  * What it records per run (merged into one row):
  *   in-app   conversion time, encode time, stage split, encoder latency, fps, output verification
@@ -21,6 +24,7 @@ import { existsSync, mkdirSync, writeFileSync } from 'node:fs'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { FIXTURES, SCENARIOS } from './scenarios.mjs'
+import { exitCode, summarizeScenario } from './summary.mjs'
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..')
 const argv = process.argv.slice(2)
@@ -36,6 +40,8 @@ const TRACE = has('trace')
 const HEADLESS = has('headless')
 const BUNDLED = has('chromium')
 const MATRIX = has('matrix')
+// full-file decode in the verifier (every frame/sample): on for --matrix, opt-in otherwise (slow on long outputs)
+const FULL_VERIFY = has('full-verify') || (MATRIX && !has('quick-verify'))
 const SERVER = val('server', 'http://127.0.0.1:5199')
 
 const log = (...a) => console.log('[bench]', ...a)
@@ -73,22 +79,6 @@ async function ensureApp() {
 }
 
 // ------------------------------------------------------------------ helpers
-const median = (xs) => {
-  const v = xs.filter((x) => typeof x === 'number' && Number.isFinite(x)).sort((a, b) => a - b)
-  if (!v.length) return null
-  const m = Math.floor(v.length / 2)
-  return v.length % 2 ? v[m] : (v[m - 1] + v[m]) / 2
-}
-
-function medianRow(rows) {
-  const out = { ...rows[0] }
-  for (const k of Object.keys(rows[0])) {
-    if (typeof rows[0][k] === 'number') out[k] = median(rows.map((r) => r[k]))
-  }
-  out.runs = rows.length
-  return out
-}
-
 function csv(rows) {
   const cols = [...new Set(rows.flatMap((r) => Object.keys(r)))]
   const esc = (v) => (v === null || v === undefined ? '' : /[",\n]/.test(String(v)) ? `"${String(v).replace(/"/g, '""')}"` : String(v))
@@ -156,6 +146,8 @@ async function main() {
   const isolated = await page.evaluate(() => crossOriginIsolated)
   if (!isolated) log('WARNING: page is not cross-origin isolated; extension WASM will use slower threading')
   await page.evaluate((pid) => window.__nleBench.setRootPid(pid), browserPid)
+  await page.evaluate((on) => (on ? localStorage.setItem('bench.fullVerify', '1') : localStorage.removeItem('bench.fullVerify')), FULL_VERIFY)
+  log(`output verification: ${FULL_VERIFY ? 'full decode (every frame and sample)' : 'head + tail decode'}`)
   const selfTest = await page.evaluate(() => window.__nleBench.selfTestMainThread())
   log(`main-thread probe self-test (3 × 120 ms injected): ${selfTest.longTasks} long tasks, TBT ${Math.round(selfTest.tbtMs)} ms, longest ${Math.round(selfTest.longestTaskMs)} ms${selfTest.longTaskSupported ? '' : ' (Long Tasks API unsupported!)'}`)
   const cdp = await context.newCDPSession(page)
@@ -264,12 +256,15 @@ async function main() {
           `${sc.id} #${i + 1}: ${report.status} conv ${Math.round(report.derived.conversionMs)} ms · enc ${report.derived.encodeMs === null ? 'pipelined' : Math.round(report.derived.encodeMs) + ' ms'} · ${row.realtimeX ?? '—'}× · TBT ${row.mtTbtMs ?? '—'} ms · CPU ${row.sysCpuAvg ?? '—'}% · GPU ${row.gpuAvg ?? '—'}%${report.error ? ` · ${report.error}` : ''}`,
         )
       }
-      const ok = scRows.filter((r) => r.status === 'done')
-      if (ok.length) {
-        const m = medianRow(ok)
-        rows.push({ ...m, run: 'median' })
+      // medians only from runs that finished AND passed output verification
+      const sum = summarizeScenario(scRows)
+      if (sum.failed) log(`${sc.id}: ${sum.failed}/${sum.runs} run(s) failed — ${sum.firstFailure}`)
+      if (sum.median) {
+        const m = sum.median
+        rows.push(m)
         summary.push({
           scenario: sc.id,
+          'passed/runs': `${sum.passed}/${sum.runs}`,
           runIn: m.runIn,
           convMs: m.conversionMs,
           encMs: m.encodeMs,
@@ -284,7 +279,7 @@ async function main() {
           MB: m.outBytes ? +(m.outBytes / 1048576).toFixed(2) : null,
           verified: m.verified,
         })
-      } else summary.push({ scenario: sc.id, status: scRows[0]?.status, error: scRows[0]?.error })
+      } else summary.push({ scenario: sc.id, 'passed/runs': `0/${sum.runs}`, status: 'FAILED', error: sum.firstFailure })
     }
     console.table(summary)
   }
@@ -297,6 +292,14 @@ async function main() {
   await browser.close()
   await server.close()
   previewProc?.kill()
+
+  // Non-zero exit when any run errored or its output failed verification (so CI can't accept bad results).
+  const runRows = rows.filter((r) => r.run !== 'median')
+  const skipped = summary.filter((x) => String(x.status ?? '').startsWith('skipped')).length
+  const failedRuns = runRows.filter((r) => !(r.status === 'done' && r.verified === true))
+  if (skipped) log(`${skipped} scenario(s) skipped (not supported here); listed above`)
+  if (failedRuns.length) log(`FAILED: ${failedRuns.length}/${runRows.length} run(s) errored or failed output verification`)
+  process.exitCode = exitCode(runRows, { skipped, failOnSkip: has('fail-on-skip') })
 }
 
 main().catch((err) => {

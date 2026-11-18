@@ -15,6 +15,8 @@ import { STICKERS } from '../media/effects/stickers'
 import { serverHealth, setAutomated, setServerRootPid } from './serverClient'
 import { flattenReport, toCSV } from './metrics'
 import { installMainThreadObservers, startMainThreadWindow } from './mainThread'
+import { runAndReport, verifyOutput } from './jobRunner'
+import { probeFile } from '../media/probe'
 
 function settingsFor(base, patch) {
   return { ...base, ...patch }
@@ -113,6 +115,17 @@ const api = {
    * V1 two halves of the clip with a cross dissolve + Vintage filter on the first half,
    * V2 animated star sticker + lower-third text, V3 Cinematic adjustment layer with vignette.
    */
+  /** Test hook: a timeline with one audio clip of `dur` seconds from `assetId` (audio-only exports). */
+  buildAudioTimeline(assetId, dur) {
+    const st = getState()
+    const asset = st.project.assets.find((a) => a.id === assetId)
+    if (!asset) throw new Error(`unknown asset ${assetId}`)
+    const p = { ...st.project, clips: [], transitions: [] }
+    const [a1] = audioTracks(p)
+    p.clips.push(makeClip('audio', a1.id, 0, Math.min(dur, asset.info.duration), { assetId: asset.id }))
+    replaceProject(p)
+  },
+
   buildEffectsTimeline(assetId) {
     const st = getState()
     const asset = assetId ? st.project.assets.find((a) => a.id === assetId) : st.project.assets.find((a) => a.info.kind === 'video')
@@ -401,6 +414,30 @@ const api = {
     if (!res) throw new Error('export did not start')
     if (!opts.keepOutput) releaseOutput(res.report.id)
     return res.report
+  },
+
+  /**
+   * Test hook (bench/regress.mjs): export the current timeline over an EXACT range through the normal job runner,
+   * without the UI. With opts.keepFile the output File is kept as window.__nleBench.lastFile.
+   */
+  async exportRange(range, patch = {}, opts = {}) {
+    const project = getState().project
+    const settings = settingsFor(defaultEncodeSettings(project), patch)
+    const { report, file } = await runAndReport({ kind: 'export', project, settings, range, target: { kind: 'buffer' } }, { runIn: opts.runIn ?? 'worker', label: opts.label ?? 'range export' })
+    if (opts.keepFile) this.lastFile = file
+    return report
+  },
+
+  /** Test hook: probe a File (or the output of a kept report) independently of the verifier. */
+  async probe(fileOrReportId) {
+    let f = fileOrReportId
+    if (typeof f === 'string') f = new File([await (await fetch(getState().outputs[f])).blob()], 'out')
+    return probeFile(f)
+  },
+
+  /** Test hook: run the output verifier on a File as if `job` had produced it. */
+  verifyFile(file, job, expectedDuration, expect = {}) {
+    return verifyOutput(file, job, expectedDuration, expect)
   },
 
   async convert(assetId, patch = {}, opts = {}) {

@@ -70,30 +70,75 @@ function inputSummary(job) {
   }
 }
 
-async function verifyOutput(file, job, expectedDuration) {
+/** Sample rates a codec imposes regardless of the request (the encoder resamples): Opus always runs at 48 kHz. */
+const FORCED_RATE = { opus: 48000 }
+/** "video/x-matroska; codecs=…" → "matroska" (subtype without x- prefix), so output-format and probed MIME compare. */
+const mimeKind = (m) => ((m ?? '').split(';')[0].split('/')[1] ?? '').toLowerCase().replace(/^x-/, '')
+
+/**
+ * Re-opens the output and checks it is what the job was asked to produce:
+ *  - it really decodes (head + tail by default; every frame/sample with opts.full: see decodeCheck)
+ *  - the tracks the job meant to write are present (expect.tracks from the job result)
+ *  - codecs, container (expect.mimeType vs the re-probed MIME), size, frame rate, audio sample rate and channels
+ *  - duration within max(0.15 s, 2 frames) (encoder priming adds tens of ms on AAC / MP3 / Opus)
+ *  - full mode: decoded frame count and audio length against the expected duration
+ */
+export async function verifyOutput(file, job, expectedDuration, expect = {}) {
   try {
     const info = await probeFile(file)
-    const problems = await decodeCheck(file)
+    const full = !!expect.full
+    const dec = await decodeCheck(file, { full })
+    const problems = [...dec.problems]
     const s = job.settings
-    const expectVideo = !!s.videoCodec && !!info && !/^(mp3|wav|aac|flac|ogg)$/.test(s.container)
-    if (expectVideo && info.video?.codec !== s.videoCodec) problems.push(`video codec is ${info.video?.codec ?? 'missing'}, expected ${s.videoCodec}`)
+    const audioOnlyContainer = /^(mp3|wav|aac|flac|ogg)$/.test(s.container)
+    const expectVideo = expect.tracks ? !!expect.tracks.video : !!s.videoCodec && !audioOnlyContainer
+    const expectAudio = expect.tracks ? !!expect.tracks.audio : job.kind === 'convert' ? !!s.audioCodec && !!job.asset?.info?.audio : null
+    const copiedVideo = job.kind === 'convert' && job.engine === 'conversion' && job.allowCopy && job.asset?.info?.video?.codec === s.videoCodec
+
+    if (expectVideo && !info.video) problems.push('video track is missing')
+    if (expectAudio && !info.audio) problems.push('audio track is missing')
+    if (expectVideo && info.video && info.video.codec !== s.videoCodec) problems.push(`video codec is ${info.video.codec}, expected ${s.videoCodec}`)
     if (s.audioCodec && info.audio && info.audio.codec !== s.audioCodec) problems.push(`audio codec is ${info.audio.codec}, expected ${s.audioCodec}`)
-    const tol = Math.max(0.15, 2 / s.fps)
-    if (Math.abs(info.duration - expectedDuration) > tol) problems.push(`duration ${info.duration.toFixed(3)}s vs expected ${expectedDuration.toFixed(3)}s`)
+    if (expect.mimeType && info.mimeType && mimeKind(expect.mimeType) !== mimeKind(info.mimeType)) problems.push(`container is ${info.mimeType}, expected ${expect.mimeType}`)
+
     if (expectVideo && info.video && (info.video.width !== s.width || info.video.height !== s.height)) {
       // Conversion with stream copy keeps the source size; only flag when we re-encoded.
-      const copied = job.kind === 'convert' && job.engine === 'conversion' && job.allowCopy && job.asset.info.video?.codec === s.videoCodec
-      if (!copied) problems.push(`size ${info.video.width}×${info.video.height}, expected ${s.width}×${s.height}`)
+      if (!copiedVideo) problems.push(`size ${info.video.width}×${info.video.height}, expected ${s.width}×${s.height}`)
+    }
+    // probe fps comes from packet statistics: allow 2 %
+    if (expectVideo && info.video?.fps > 0 && s.fps > 0 && !copiedVideo && Math.abs(info.video.fps - s.fps) / s.fps > 0.02)
+      problems.push(`frame rate ${info.video.fps.toFixed(3)}, expected ${s.fps}`)
+
+    if (info.audio && s.audioCodec) {
+      const wantRate = FORCED_RATE[s.audioCodec] ?? s.sampleRate
+      if (wantRate && info.audio.sampleRate !== wantRate) problems.push(`audio sample rate ${info.audio.sampleRate} Hz, expected ${wantRate} Hz`)
+      if (s.audioChannels && info.audio.channels !== s.audioChannels) problems.push(`audio has ${info.audio.channels} channel(s), expected ${s.audioChannels}`)
+    }
+
+    const tol = Math.max(0.15, 2 / s.fps)
+    if (Math.abs(info.duration - expectedDuration) > tol) problems.push(`duration ${info.duration.toFixed(3)}s vs expected ${expectedDuration.toFixed(3)}s`)
+    if (full) {
+      const frameRate = copiedVideo ? job.asset.info.video.fps : s.fps
+      const wantFrames = Math.round(expectedDuration * frameRate)
+      if (dec.videoFrames !== null && Math.abs(dec.videoFrames - wantFrames) > 2) problems.push(`decoded ${dec.videoFrames} video frames, expected ~${wantFrames}`)
+      if (dec.audioSeconds !== null && Math.abs(dec.audioSeconds - expectedDuration) > tol) problems.push(`decoded ${dec.audioSeconds.toFixed(3)} s of audio, expected ~${expectedDuration.toFixed(3)} s`)
     }
     return {
       ok: problems.length === 0,
       problems,
+      depth: dec.depth,
       container: info.container,
+      mimeType: info.mimeType,
       videoCodec: info.video?.codec ?? null,
       audioCodec: info.audio?.codec ?? null,
       duration: info.duration,
       width: info.video?.width,
       height: info.video?.height,
+      fps: info.video?.fps ?? null,
+      sampleRate: info.audio?.sampleRate ?? null,
+      channels: info.audio?.channels ?? null,
+      decodedFrames: dec.videoFrames,
+      decodedAudioSeconds: dec.audioSeconds,
     }
   } catch (err) {
     return { ok: false, problems: [`output could not be re-opened: ${err instanceof Error ? err.message : String(err)}`] }
@@ -220,7 +265,13 @@ export async function runAndReport(job, opts) {
     else if (job.target.kind === 'stream') file = await job.target.handle.getFile()
   }
   const input = inputSummary(job)
-  const verify = file && result ? await verifyOutput(file, job, result.mediaDuration) : null
+  let fullVerify = false
+  try {
+    fullVerify = opts.fullVerify ?? localStorage.getItem('bench.fullVerify') === '1'
+  } catch {
+    /* no storage in this context */
+  }
+  const verify = file && result ? await verifyOutput(file, job, result.mediaDuration, { tracks: result.tracks, mimeType: result.mimeType, full: fullVerify }) : null
   const memory = await memProbe.stop() // after wallMs/timings, so waiting for it never inflates them
   const bytes = result?.outputBytes ?? 0
   const report = {

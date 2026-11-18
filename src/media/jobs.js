@@ -297,14 +297,18 @@ async function exportProject(project, s, range, jobTarget, baseName, hooks) {
   const channels = s.audioChannels
   const audioReaders = new Map()
   const gainFn = makeGainFn(project)
-  let audioTime = 0 // relative to range.start
+  // Audio progress is an INTEGER sample cursor with an exact integer target. (A float time compared against the
+  // duration could leave a sub-sample remainder that rounds to 0 frames forever: the export hung.)
+  const audioTotal = Math.round(duration * rate)
+  let audioPos = 0 // samples written, relative to range.start
+  let audioTime = 0 // = audioPos / rate
   const AUDIO_CHUNK = Math.round(rate * 0.1)
 
   const pushAudioUntil = async (until) => {
     if (!audioSource) return
-    while (audioTime < until && audioTime < duration - 1e-9) {
-      const frames = Math.min(AUDIO_CHUNK, Math.round((duration - audioTime) * rate))
-      if (frames <= 0) break
+    const target = Math.min(audioTotal, Math.ceil(until * rate - 1e-6))
+    while (audioPos < target) {
+      const frames = Math.min(AUDIO_CHUNK, audioTotal - audioPos)
       const tm = now()
       const planes = Array.from({ length: channels }, () => new Float32Array(frames))
       const absT = range.start + audioTime
@@ -332,7 +336,8 @@ async function exportProject(project, s, range, jobTarget, baseName, hooks) {
       await audioSource.add(sample)
       timings.audioEncodeWait += now() - te
       sample.close()
-      audioTime += frames / rate
+      audioPos += frames
+      audioTime = audioPos / rate
     }
   }
 
@@ -413,7 +418,7 @@ async function exportProject(project, s, range, jobTarget, baseName, hooks) {
   }
 
   // Audio-only exports (or remaining audio tail).
-  while (audioSource && audioTime < duration - 1e-9) {
+  while (audioSource && audioPos < audioTotal) {
     await abortIfNeeded()
     await pushAudioUntil(audioTime + 1)
     report(audioTime)
@@ -439,6 +444,7 @@ async function exportProject(project, s, range, jobTarget, baseName, hooks) {
     outputBytes: buffer?.byteLength ?? handle.bytes(),
     buffer,
     mimeType: format.mimeType,
+    tracks: { video: wantVideo, audio: wantAudio }, // what the job set out to write (the verifier checks the file has them)
     fileName: fileNameFor(baseName, s),
     peakHeapMB: heap.peak,
     context: isWorker ? 'worker' : 'main',
@@ -466,7 +472,14 @@ async function runConversion(job, hooks) {
     src.video.width === s.width &&
     src.video.height === s.height &&
     Math.abs(src.video.fps - s.fps) < 0.01
-  const audioSame = wantAudio && job.allowCopy && src.audio.codec === s.audioCodec
+  // Copy only when the stream already IS what was asked for: codec, sample rate and channel count (otherwise a
+  // "successful" copy silently ignored the requested resampling / remixing).
+  const audioSame =
+    wantAudio &&
+    job.allowCopy &&
+    src.audio.codec === s.audioCodec &&
+    (s.sampleRate == null || src.audio.sampleRate === s.sampleRate) &&
+    (s.audioChannels == null || src.audio.channels === s.audioChannels)
 
   const video = !wantVideo
     ? { discard: true }
@@ -551,6 +564,7 @@ async function runConversion(job, hooks) {
     outputBytes: buffer?.byteLength ?? handle.bytes(),
     buffer,
     mimeType: format.mimeType,
+    tracks: { video: wantVideo, audio: wantAudio }, // what the job set out to write (the verifier checks the file has them)
     fileName: fileNameFor(job.asset.name, s),
     conversion: {
       discarded,

@@ -132,22 +132,33 @@ export async function probeFile(file) {
 }
 
 /**
- * Actually decodes the first video frame and first audio sample with Mediabunny.
- * Used to verify exports: a file can probe fine yet fail to decode.
+ * Really decodes the output with Mediabunny (a file can probe fine yet fail to decode).
+ *  - default ('head+tail'): the first 3 video frames and audio samples, the LAST video frame and the final ~0.25 s
+ *    of audio. The tail check catches truncated files whose index still claims the missing frames.
+ *  - full: every video frame and audio sample (slow on long files; `--matrix` and opt-in only). Returns the decoded
+ *    frame count and audio duration so the caller can compare them with what was expected.
  */
-export async function decodeCheck(file) {
+export async function decodeCheck(file, { full = false } = {}) {
   const problems = []
+  const out = { depth: full ? 'full' : 'head+tail', videoFrames: null, audioSeconds: null }
   const input = openInput(file)
   try {
     const v = await input.getPrimaryVideoTrack()
     if (v) {
       if (!(await v.canDecode())) problems.push(`video ${v.codec ?? '?'} is not decodable`)
       else {
+        const sink = new CanvasSink(v, { width: 64, height: 36, fit: 'fill' })
         let frames = 0
-        for await (const _ of new CanvasSink(v, { width: 64, height: 36, fit: 'fill' }).canvases()) {
-          if (++frames >= 3) break
+        for await (const _ of sink.canvases()) {
+          if (++frames >= 3 && !full) break
         }
         if (!frames) problems.push('no video frame could be decoded')
+        if (full) out.videoFrames = frames
+        else {
+          const end = await v.computeDuration()
+          const last = end > 0 ? await sink.getCanvas(Math.max(0, end - 1e-3)) : null
+          if (!last) problems.push(`the last video frame (at ${end.toFixed(3)} s) could not be decoded`)
+        }
       }
     }
     const a = await input.getPrimaryAudioTrack()
@@ -156,12 +167,25 @@ export async function decodeCheck(file) {
       else {
         // Iterate instead of getSample(firstTimestamp): codecs with priming (Opus pre-skip, MP3 delay)
         // may have no output sample at the exact first packet timestamp.
+        const sink = new AudioSampleSink(a)
         let samples = 0
-        for await (const smp of new AudioSampleSink(a).samples()) {
+        let seconds = 0
+        for await (const smp of sink.samples()) {
+          seconds += smp.duration
           smp.close()
-          if (++samples >= 3) break
+          if (++samples >= 3 && !full) break
         }
         if (!samples) problems.push('no audio sample could be decoded')
+        if (full) out.audioSeconds = seconds
+        else {
+          const end = await a.computeDuration()
+          let tail = 0
+          for await (const smp of sink.samples(Math.max(0, end - 0.25), end)) {
+            tail++
+            smp.close()
+          }
+          if (end > 0.3 && !tail) problems.push(`the last audio samples (before ${end.toFixed(3)} s) could not be decoded`)
+        }
       }
     }
   } catch (err) {
@@ -169,7 +193,7 @@ export async function decodeCheck(file) {
   } finally {
     input.dispose()
   }
-  return problems
+  return { problems, ...out }
 }
 
 /** Small JPEG thumbnail as a data URL (main thread). */

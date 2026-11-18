@@ -28,6 +28,7 @@ A browser-based non-linear video editor (NLE) whose purpose is **benchmarking Me
   - `--trace` saves Chrome traces.
   - `--headless` / `--chromium` choose a different browser setup.
 - `npm run bench:matrix`: round-trips every encodable container × codec (convert, then re-probe).
+- `npm run test:regress`: regression tests for the defects found by the 2026-11-18 audits (`bench/regress.mjs`: fractional audio tails, copy ignoring audio settings, verifier false positives) plus `bench/summary.test.mjs`. Each test failed on the unfixed code.
 - `npm run test:ui`: UI smoke tests through the real UI. `bench/ui-smoke.mjs` covers editing; `bench/effects-smoke.mjs` covers text, stickers, filters, transitions, copy/paste and effects exports. Screenshots go to `bench-results/ui-smoke/` and `bench-results/effects-smoke/`.
 - `node bench/showcase.mjs [--files a b c] [--export] [--no-sfx] [--test]`: opens headed Chrome on the running dev server (or starts one), imports 3 videos (or waits for you to), builds the all-tools showcase edit (`buildShowcase` in `harness.js`) and leaves the window open. It also imports the synthesized SFX kit from `bench/sfx/` (`node bench/make-sfx.mjs` regenerates it); any asset named `sfx-<name>.wav` is placed on A2+. Export only with `--export`.
 - `npx playwright install chromium` is needed only for `--chromium`. The default uses the installed Chrome.
@@ -117,7 +118,13 @@ The `JobReport` shape built in `src/bench/metrics.js` (`deriveMetrics`) and `job
   - macOS per-process GPU: powermetrics lists a GPU ms/s column but reports 0.00 for every task on macOS 26 (`--process-gpu` picks it up if that changes).
   - Safari is a WebKit name group, shared with other WebKit apps.
   - Windows paths are untested.
-- `verifyOutput` (in `jobRunner.js`) re-probes each output and really decodes it (`decodeCheck` in `probe.js`), so `--matrix` doubles as an import/decode test.
+- **Output verification:** `verifyOutput` (in `jobRunner.js`) re-probes each output and decodes it (`decodeCheck` in `probe.js`).
+  - **Checks:** the tracks the job meant to write are present (`result.tracks`); codecs; container (output-format MIME vs re-probed MIME); size; frame rate (±2 %); audio sample rate (except codec-imposed rates, e.g. Opus at 48 kHz) and channels; duration within max(0.15 s, 2 frames).
+  - **Decode depth:** by default the first 3 frames and samples **plus the last video frame and the final ~0.25 s of audio**, which catches truncated files. Full decode (every frame and sample, with the frame count and audio length compared) is on for `--matrix`, and opt-in with `--full-verify` or `localStorage['bench.fullVerify'] = '1'`. `verify.depth` records which one ran.
+  - `status: 'done'` only means the job ran; `verify.ok` is the content check.
+  - `bench/run.mjs` builds medians only from runs with `verify.ok` (`bench/summary.mjs`), and exits 1 if any run errored or failed verification.
+- **Audio progress in exports** is an integer sample cursor (`audioPos` / `audioTotal` in `jobs.js`). Never compare a float audio time against the duration: a sub-sample remainder used to hang the export.
+- **Conversion stream copy** happens only when codec, sample rate **and** channel count already match the request (`audioSame` in `jobs.js`).
 
 ## Gotchas
 - COOP `same-origin` and COEP `require-corp` are required. The extension WASM uses shared-memory threads, so without them it falls back to a slower path and skews the benchmarks. Don't load cross-origin resources (fonts, CDNs) without CORP/CORS.
