@@ -33,11 +33,11 @@ export function TransformOverlay({ k }) {
   const boundsOf = (c) => clipBounds(project, c, sourceSize(project, c))
   const selectedClip = selection.length === 1 ? active.find((c) => c.id === selection[0]) : undefined
 
-  /** Topmost clip under a point (project px). activeVisualClips is bottom → top. */
+  /** Topmost clip under a point (project px), honouring the clip's rotation. activeVisualClips is bottom → top. */
   const hitTest = (px, py) => {
     for (let i = active.length - 1; i >= 0; i--) {
       const b = boundsOf(active[i])
-      if (b && px >= b.x && px <= b.x + b.w && py >= b.y && py <= b.y + b.h) return active[i]
+      if (b && insideRotated(b, active[i].rotation ?? 0, px, py)) return active[i]
     }
     return undefined
   }
@@ -162,7 +162,13 @@ export function TransformOverlay({ k }) {
   const sb = selectedClip ? boundsOf(selectedClip) : null
   const hoverClip = hover && hover !== selectedClip?.id ? active.find((c) => c.id === hover) : undefined
   const hb = hoverClip ? boundsOf(hoverClip) : null
-  const box = (b) => ({ left: b.x * k, top: b.y * k, width: b.w * k, height: b.h * k })
+  const box = (b, c) => ({
+    left: b.x * k,
+    top: b.y * k,
+    width: b.w * k,
+    height: b.h * k,
+    ...(c?.rotation ? { transform: `rotate(${c.rotation}deg)`, transformOrigin: '50% 50%' } : {}),
+  })
 
   return (
     <div
@@ -182,11 +188,11 @@ export function TransformOverlay({ k }) {
       }}
       onPointerLeave={() => setHover(null)}
     >
-      {hb && <div className="xform-hover" style={box(hb)} />}
+      {hb && <div className="xform-hover" style={box(hb, hoverClip)} />}
       {sb && selectedClip && (
         <div
           className={`xform-box${locked.has(selectedClip.trackId) ? ' locked' : ''}`}
-          style={box(sb)}
+          style={box(sb, selectedClip)}
           onPointerDown={(e) => e.button === 0 && begin(e, selectedClip, 'move')}
           title={locked.has(selectedClip.trackId) ? 'Track is locked' : 'Drag to move · Shift locks axis · Alt disables snapping'}
         >
@@ -206,4 +212,14 @@ export function TransformOverlay({ k }) {
       {guides.h && <div className="xform-guide h" />}
     </div>
   )
+}
+
+/** Is (px, py) inside rect `b` rotated by `deg` around its centre (the compositor rotates clips that way)? */
+function insideRotated(b, deg, px, py) {
+  const r = (-deg * Math.PI) / 180
+  const dx = px - (b.x + b.w / 2)
+  const dy = py - (b.y + b.h / 2)
+  const lx = dx * Math.cos(r) - dy * Math.sin(r)
+  const ly = dx * Math.sin(r) + dy * Math.cos(r)
+  return Math.abs(lx) <= b.w / 2 && Math.abs(ly) <= b.h / 2
 }

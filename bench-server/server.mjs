@@ -698,9 +698,6 @@ async function takeSample() {
     gpuTilerPct: gpu?.tiler ?? null,
     gpuEncoderPct: gpu?.encoder ?? null,
     gpuDecoderPct: gpu?.decoder ?? null,
-    // per-process GPU (Windows counters) is summed over every sampled browser
-    gpuBrowserEncoderPct: gpu?.browserEncoder ?? null,
-    browserGpuMemMB: gpu?.browserGpuMemMB ?? null,
     gpuCount: gpu?.gpus ?? null,
     gpuPowerW: power.ok ? power.gpuW : (gpu?.powerW ?? null),
     cpuPowerW: power.ok ? power.cpuW : raplW,
@@ -708,15 +705,25 @@ async function takeSample() {
     // Apple Silicon CPU clusters from powermetrics: {E: {mhz, activePct}, P: {...}} (P0/P1 on Max chips)
     cpuClusters: power.ok && Object.keys(power.clusters).length ? structuredClone(power.clusters) : null,
   }
+  // Windows per-process GPU counters: computed per browser view, so two sessions in different browsers don't share
+  const procGpu = (v) => {
+    if (PLATFORM !== 'win32' || !win.gpu || !v?.pids) return { browser3d: gpu?.browser3d ?? null, browserEncoder: gpu?.browserEncoder ?? null, memMB: gpu?.browserGpuMemMB ?? null }
+    const g = P.summarizeGpuEngines(win.gpu, v.pids)
+    const mem = P.summarizeGpuProcessMemory(win.gpu, v.pids)
+    return { browser3d: g.browser3d, browserEncoder: g.browserEncoder, memMB: mem.dedicatedMB + mem.sharedMB }
+  }
   const withBrowser = (v) => ({
     ...system,
+    ...(() => {
+      const pg = procGpu(v)
+      return { gpuBrowserEncoderPct: pg.browserEncoder, browserGpuMemMB: pg.memMB, gpuBrowserPct: pg.browser3d ?? (PROCESS_GPU ? powermetricsBrowserGpu(v?.pids) : null) }
+    })(),
     browserCpuPct: v?.total ?? null,
     browserCpuByType: v?.byType ?? {},
     browserRssMB: v?.rssMB ?? null,
     browserFootprintMB: v?.footprintMB ?? null,
     browserProcs: v?.count ?? 0,
     selectMode: v?.mode ?? null,
-    gpuBrowserPct: gpu?.browser3d ?? (PROCESS_GPU ? powermetricsBrowserGpu(v?.pids) : null),
   })
   const s = withBrowser(primary)
   const perRoot = new Map([[roots[0], s]])
@@ -927,10 +934,30 @@ function recordSummary(r) {
 
 // ------------------------------------------------------------------ HTTP API
 
+/**
+ * Only this machine may talk to the server. Any website open in the browser could otherwise read every saved record
+ * or DELETE them (CORS used to be '*'), and DNS rebinding could reach it under a foreign host name.
+ *  - Origin (sent by browsers on cross-origin and non-GET requests): must be http(s)://localhost | 127.0.0.1 | [::1]
+ *  - Host: must be one of those names (any port is fine: the dashboard, Vite dev/preview and Playwright all use them)
+ * Requests without an Origin (the Vite bridge, Node scripts, curl, same-origin GETs) are allowed.
+ */
+const LOCAL_HOST_RE = /^(localhost|127\.0\.0\.1|\[::1\])(:\d+)?$/i
+const MAX_BODY_BYTES = 16 * 1024 * 1024
+function localOrigin(origin) {
+  if (!origin) return null
+  try {
+    const u = new URL(origin)
+    return /^https?:$/.test(u.protocol) && LOCAL_HOST_RE.test(u.host) ? origin : false
+  } catch {
+    return false
+  }
+}
+
 function send(res, code, body, type = 'application/json') {
+  const origin = res.req ? localOrigin(res.req.headers.origin) : null
   res.writeHead(code, {
     'content-type': type,
-    'access-control-allow-origin': '*',
+    ...(origin ? { 'access-control-allow-origin': origin, vary: 'origin' } : {}),
     'access-control-allow-headers': 'content-type',
     'access-control-allow-methods': 'GET,POST,DELETE,OPTIONS',
     // Allow use under COEP: require-corp if a page calls us directly instead of via the Vite bridge.
@@ -940,10 +967,20 @@ function send(res, code, body, type = 'application/json') {
   res.end(type === 'application/json' ? JSON.stringify(body) : body)
 }
 
+/** JSON body, at most MAX_BODY_BYTES (a larger request is cut off and answered 413). */
 function readBody(req) {
   return new Promise((resolve) => {
     let data = ''
-    req.on('data', (c) => (data += c))
+    let size = 0
+    req.on('data', (c) => {
+      size += c.length
+      if (size > MAX_BODY_BYTES) {
+        req.tooLarge = true
+        req.destroy()
+        return resolve({})
+      }
+      data += c
+    })
     req.on('end', () => {
       try {
         resolve(data ? JSON.parse(data) : {})
@@ -983,13 +1020,16 @@ setInterval(
   Math.min(5000, SESSION_TIMEOUT_MS / 2),
 )
 
-/** Stop a session's sampling at `at` and close its overlap intervals (on both sides). */
+/**
+ * Stop a session's sampling at `at` and close its overlap intervals on BOTH sides. An overlap ends when the first
+ * of the two jobs stops sampling, so a finished job's overlap never grows when the other one runs on.
+ */
 function endSampling(id, sess, at = Date.now()) {
   sess.sampleEnd ??= at
-  for (const oid of sess.overlaps.keys()) {
-    const other = sessions.get(oid) ?? finished.get(oid)
-    const entry = other?.overlaps.get(id)
-    if (entry && entry.to === null) entry.to = at
+  for (const [oid, mine] of sess.overlaps) {
+    if (mine.to === null) mine.to = at
+    const theirs = (sessions.get(oid) ?? finished.get(oid))?.overlaps.get(id)
+    if (theirs && theirs.to === null) theirs.to = at
   }
 }
 
@@ -1016,6 +1056,8 @@ let nextId = Date.now() % 100000
 const server = http.createServer(async (req, res) => {
   const url = new URL(req.url ?? '/', 'http://localhost')
   const p = url.pathname
+  if (!LOCAL_HOST_RE.test(req.headers.host ?? '') || localOrigin(req.headers.origin) === false) return send(res, 403, { error: 'bench-server only accepts requests from this machine (localhost origins)' })
+  if (Number(req.headers['content-length']) > MAX_BODY_BYTES) return send(res, 413, { error: 'request body too large' })
   if (req.method === 'OPTIONS') return send(res, 204, {})
 
   // dashboard page

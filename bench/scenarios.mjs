@@ -11,6 +11,9 @@ export const FIXTURES = {
   h264_1080p30: { container: 'mp4', videoCodec: 'avc', audioCodec: 'aac', width: 1920, height: 1080, fps: 30, duration: 10 },
   h264_4k30: { container: 'mp4', videoCodec: 'avc', audioCodec: 'aac', width: 3840, height: 2160, fps: 30, duration: 5 },
   matrix_small: { container: 'mp4', videoCodec: 'avc', audioCodec: 'aac', width: 640, height: 360, fps: 30, duration: 2 },
+  // harder, camera-like content (fine panning detail + per-frame sensor noise) and a 2 s GOP; still synthetic.
+  // Real footage: put files in bench/fixtures/ and use fixture: 'file:<name>'.
+  camera_1080p30: { container: 'mp4', videoCodec: 'avc', audioCodec: 'aac', width: 1920, height: 1080, fps: 30, duration: 10, content: 'camera', keyFrameInterval: 2 },
 }
 
 const v = (container, videoCodec, audioCodec, extra = {}) => ({ container, videoCodec, audioCodec, ...extra })
@@ -40,4 +43,9 @@ export const SCENARIOS = [
   { id: 'export-effects-worker', type: 'export', timeline: 'effects', fixture: 'h264_1080p30', runIn: 'worker', settings: v('mp4', 'avc', 'aac') },
   { id: 'export-effects-main', type: 'export', timeline: 'effects', fixture: 'h264_1080p30', runIn: 'main', settings: v('mp4', 'avc', 'aac') },
   { id: 'export-h264-4k-worker', type: 'export', fixture: 'h264_4k30', runIn: 'worker', settings: v('mp4', 'avc', 'aac', { width: 3840, height: 2160 }), projectSize: [3840, 2160] },
+  // --- camera-like content (harder to encode than the gradient fixtures; see FIXTURES.camera_1080p30)
+  { id: 'conv-camera-h264-mp4', type: 'convert', fixture: 'camera_1080p30', engine: 'conversion', allowCopy: false, settings: v('mp4', 'avc', 'aac') },
+  { id: 'conv-camera-vp9-webm', type: 'convert', fixture: 'camera_1080p30', engine: 'conversion', allowCopy: false, settings: v('webm', 'vp9', 'opus') },
+  { id: 'export-camera-worker', type: 'export', fixture: 'camera_1080p30', runIn: 'worker', settings: v('mp4', 'avc', 'aac') },
+  { id: 'export-camera-main', type: 'export', fixture: 'camera_1080p30', runIn: 'main', settings: v('mp4', 'avc', 'aac') },
 ]

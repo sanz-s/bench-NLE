@@ -7,9 +7,16 @@
 // ------------------------------------------------------------------ layer pool
 
 const free = new Map()
+let outstanding = 0
+
+/** Pool diagnostics (test hook): layers currently borrowed and not yet released. */
+export function poolStats() {
+  return { outstanding }
+}
 
 /** Borrow a cleared W×H layer. Always `release()` it in the same frame. */
 export function acquire(w, h) {
+  outstanding++
   const W = Math.max(1, Math.round(w))
   const H = Math.max(1, Math.round(h))
   const key = `${W}x${H}`
@@ -31,6 +38,7 @@ export function acquire(w, h) {
 export function release(...layers) {
   for (const l of layers) {
     if (!l) continue
+    outstanding--
     const key = `${l.canvas.width}x${l.canvas.height}`
     const list = free.get(key) ?? []
     if (list.length < 12) list.push(l)

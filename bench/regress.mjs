@@ -9,6 +9,9 @@
  *   F3  the output verifier passed files with the wrong audio config, a missing audio track, or a truncated tail
  *   B1  AAC always ran on the WASM extension (never the browser's encoder), and reports didn't say which ran
  *   B2  a hidden tab during a job was not recorded
+ *   R1  the verifier treated copy-allowed conversions with matching codecs as stream copies: it skipped the size/fps
+ *       checks (false positive) and expected the SOURCE frame count in full mode (false negative)
+ *   F4  a failed disk write left the writable file neither closed nor aborted
  *
  * A hang is detected with a hard timeout; the browser context is then closed (a stuck worker can't be cancelled).
  */
@@ -218,8 +221,12 @@ for (const runIn of ['worker', 'main']) {
       }
       const id = await window.__nleBench.generateFixture({ width: 640, height: 360, duration: 4, fps: 30 })
       window.__nleBench.buildTestTimeline(id)
-      setTimeout(() => flip('hidden'), 50)
-      setTimeout(() => flip('visible'), 350)
+      // flip relative to the job's own start (jobRunner awaits this gate right before the job)
+      window.__nleBenchGate = async (name) => {
+        if (name !== 'job-start') return
+        setTimeout(() => flip('hidden'), 30)
+        setTimeout(() => flip('visible'), 330)
+      }
       const rep = await window.__nleBench.exportRange({ start: 0, end: 4 }, { container: 'mp4', videoCodec: 'avc', audioCodec: 'aac', width: 640, height: 360 }, { runIn: 'worker' })
       return { wallMs: rep.derived.wallMs, visibility: rep.visibility }
     }),
@@ -227,6 +234,76 @@ for (const runIn of ['worker', 'main']) {
   const v = r?.visibility
   const ok = r !== 'TIMEOUT' && v && v.changes === 2 && v.hiddenMs > 200 && v.hiddenMs < 500 && v.startedHidden === false && v.endedHidden === false
   record('B2 a tab hidden mid-job is recorded (≈300 ms hidden)', ok, JSON.stringify(r))
+}
+
+// ---------------------------------------------------------------- R1: copy-allowed conversions are verified against the request
+{
+  const r = await withTimeout(60000, (page) =>
+    page.evaluate(async () => {
+      const b = window.__nleBench
+      b.reset(320, 180, 30)
+      const id = await b.generateFixture({ width: 320, height: 180, duration: 1, fps: 30 })
+      b.buildTestTimeline(id)
+      await b.exportRange({ start: 0, end: 1 }, { container: 'mp4', videoCodec: 'avc', audioCodec: 'aac', width: 320, height: 180 }, { runIn: 'worker', keepFile: true })
+      // a 320×180 @ 30 file offered as the output of a copy-allowed 160×90 @ 60 conversion
+      const job = { kind: 'convert', engine: 'conversion', allowCopy: true, settings: { container: 'mp4', videoCodec: 'avc', audioCodec: 'aac', width: 160, height: 90, fps: 60, sampleRate: 48000, audioChannels: 2 }, asset: { info: { video: { codec: 'avc', width: 320, height: 180, fps: 30 }, audio: { codec: 'aac' } } } }
+      const v = await b.verifyFile(b.lastFile, job, 1, { tracks: { video: true, audio: true }, mimeType: 'video/mp4' })
+      return { ok: v.ok, problems: v.problems }
+    }),
+  )
+  record('R1 verifier rejects a 320×180@30 file for a copy-allowed 160×90@60 request', r !== 'TIMEOUT' && r.ok === false && r.problems.some((p) => /size/.test(p)), JSON.stringify(r))
+}
+{
+  const r = await withTimeout(60000, (page) =>
+    page.evaluate(async () => {
+      const b = window.__nleBench
+      localStorage.setItem('bench.fullVerify', '1')
+      const id = await b.generateFixture({ width: 320, height: 180, duration: 1, fps: 30 })
+      const out = {}
+      for (const depth of ['full', 'head+tail']) {
+        if (depth !== 'full') localStorage.removeItem('bench.fullVerify')
+        const rep = await b.convert(id, { container: 'mp4', videoCodec: 'avc', audioCodec: 'aac', width: 160, height: 90, fps: 60 }, { allowCopy: true })
+        out[depth] = { status: rep.status, copied: rep.conversion?.copyExpected?.video, depth: rep.verify?.depth, ok: rep.verify?.ok, problems: rep.verify?.problems }
+      }
+      return out
+    }),
+  )
+  const good = (x) => x?.status === 'done' && x.copied === false && x.ok === true
+  record('R1 a correct copy-allowed resize + 30→60 fps conversion verifies (full and head+tail)', r !== 'TIMEOUT' && good(r.full) && r.full.depth === 'full' && good(r['head+tail']), JSON.stringify(r))
+}
+
+// ---------------------------------------------------------------- F4: a failed write aborts the writable
+{
+  const r = await withTimeout(45000, (page) =>
+    page.evaluate(async () => {
+      const b = window.__nleBench
+      if (typeof b.exportToHandle !== 'function') return { missing: 'exportToHandle hook' }
+      const id = await b.generateFixture({ width: 320, height: 180, duration: 1, fps: 30 })
+      b.buildTestTimeline(id)
+      const calls = { createWritable: 0, write: 0, close: 0, abort: 0 }
+      const handle = {
+        name: 'fail.mp4',
+        createWritable: async () => {
+          calls.createWritable++
+          return {
+            write: async () => {
+              calls.write++
+              throw new Error('synthetic disk-full')
+            },
+            close: async () => void calls.close++,
+            abort: async () => void calls.abort++,
+          }
+        },
+        getFile: async () => new File([], 'fail.mp4'),
+      }
+      const rep = await b.exportToHandle({ start: 0, end: 1 }, { container: 'mp4', videoCodec: 'avc', audioCodec: 'aac', width: 320, height: 180 }, handle)
+      // the page must still be able to export normally afterwards (nothing left half-open)
+      const after = await b.exportRange({ start: 0, end: 1 }, { container: 'mp4', videoCodec: 'avc', audioCodec: 'aac', width: 320, height: 180 }, { runIn: 'main' })
+      return { status: rep.status, error: rep.error, calls, afterStatus: after.status, afterOk: after.verify?.ok }
+    }),
+  )
+  const ok = r !== 'TIMEOUT' && !r.missing && r.status === 'error' && r.calls.abort === 1 && r.calls.close === 0 && r.afterStatus === 'done' && r.afterOk === true
+  record('F4 a failed disk write aborts the writable, and the next export works', ok, JSON.stringify(r))
 }
 
 await browser.close()

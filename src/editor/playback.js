@@ -1,7 +1,7 @@
 import { AudioBufferSink } from 'mediabunny'
 import { openInput } from '../media/probe'
 import { VideoReader, containSize } from '../media/videoReader'
-import { audibleClips, clipEnd, drawFrame, frameRequests, timelineDuration } from '../media/compositor'
+import { audibleClips, clipEnd, drawFrame, frameRequests, resolveTransitions, timelineDuration } from '../media/compositor'
 import { makeGainFn } from '../media/audioMix'
 import { getState, setState, subscribe } from './store'
 
@@ -125,7 +125,7 @@ class PreviewEngine {
     const frames = new Map()
     const assetById = new Map(project.assets.map((a) => [a.id, a]))
     await Promise.all(
-      requests.map(async ({ clip: c, src }) => {
+      requests.map(async ({ clip: c, src, key: fkey }) => {
         if (!c.assetId) return
         const asset = assetById.get(c.assetId)
         if (!asset) return
@@ -136,7 +136,7 @@ class PreviewEngine {
         }
         const m = await this.getMedia(asset)
         if (!m?.video) return
-        const key = `${c.id}:${c.assetId}`
+        const key = `${fkey ?? c.id}:${c.assetId}` // Motion Trail ghosts have their own key and reader
         let r = this.readers.get(key)
         if (!r) {
           const size = containSize(m.displayW, m.displayH, this.canvas.width, this.canvas.height)
@@ -145,7 +145,7 @@ class PreviewEngine {
         }
         try {
           const f = await r.frameAt(src)
-          if (f) frames.set(c.id, { image: f.canvas, width: f.canvas.width, height: f.canvas.height })
+          if (f) frames.set(fkey ?? c.id, { image: f.canvas, width: f.canvas.width, height: f.canvas.height })
         } catch (err) {
           console.warn('preview decode failed', err)
         }
@@ -155,7 +155,7 @@ class PreviewEngine {
     drawFrame(this.ctx, project, t, frames, scale)
     // Drop readers for clips no longer near the playhead.
     for (const [key, r] of this.readers) {
-      const id = key.split(':')[0]
+      const id = key.split(':')[0].split('#')[0] // "<clip>#g<i>" → clip
       const c = project.clips.find((x) => x.id === id)
       if (!c || t < c.start - 2 || t > clipEnd(c) + 2) {
         this.readers.delete(key)
@@ -200,9 +200,31 @@ class PreviewEngine {
     this.raf = requestAnimationFrame(loop)
   }
 
+  /** Seconds between the audio context's clock and the speaker (Bluetooth can be ~200 ms). */
+  outputDelay() {
+    const c = this.audioCtx
+    if (!c) return 0
+    const d = (Number(c.outputLatency) || 0) + (Number(c.baseLatency) || 0)
+    return d > 0 && d < 2 ? d : 0
+  }
+
+  /** Timeline time being HEARD now: the picture follows the speaker, not the audio graph's clock. */
   currentPlayTime() {
     if (!this.audioCtx) return getState().time
+    return this.playT0 + Math.max(0, this.audioCtx.currentTime - this.playCtx0 - this.outputDelay())
+  }
+
+  /** Timeline time the audio graph is rendering now (where newly scheduled audio must start). */
+  scheduleTime() {
+    if (!this.audioCtx) return getState().time
     return this.playT0 + Math.max(0, this.audioCtx.currentTime - this.playCtx0)
+  }
+
+  /** Re-schedule audio from the current position (after an edit during playback), keeping the clock running. */
+  restartAudio() {
+    if (!getState().playing || !this.audioCtx) return
+    this.stopAudio()
+    this.scheduleAudio(this.scheduleTime())
   }
 
   pause() {
@@ -302,16 +324,40 @@ class PreviewEngine {
     }
   }
 
-  /** Re-render when the project changes (edits, inspector tweaks) while paused. */
+  /**
+   * React to project changes: re-render while paused (the play loop renders while playing), re-schedule
+   * audio when an audio-relevant edit happens during playback, and drop decoders/bitmaps of removed media.
+   */
   watch() {
+    let lastAssets = getState().project.assets
+    let audioProject = null
+    let audioKey = ''
+    let audioTimer = 0
     return subscribe(() => {
       const st = getState()
-      if (st.playing) return
+      if (st.project.assets !== lastAssets) {
+        lastAssets = st.project.assets
+        this.prune(st.project)
+      }
+      if (st.playing) {
+        if (st.project !== audioProject) {
+          const key = audioFingerprint(st.project)
+          if (audioProject && key !== audioKey) {
+            clearTimeout(audioTimer)
+            // coalesce slider drags into one restart
+            audioTimer = setTimeout(() => this.restartAudio(), 120)
+          }
+          audioProject = st.project
+          audioKey = key
+        }
+        return
+      }
+      audioProject = null
       if (st.project !== this.lastProject || st.time !== this.lastTime) this.requestRender(st.time)
     })
   }
 
-  /** Forget cached inputs for removed assets. */
+  /** Forget cached inputs, decoders and bitmaps for removed assets. */
   prune(project) {
     const ids = new Set(project.assets.map((a) => a.id))
     for (const [id, p] of this.media) {
@@ -320,7 +366,28 @@ class PreviewEngine {
         void p.then((m) => m?.input.dispose())
       }
     }
+    for (const [id, p] of this.bitmaps) {
+      if (!ids.has(id)) {
+        this.bitmaps.delete(id)
+        void p.then((b) => b?.close())
+      }
+    }
+    for (const [key, r] of this.readers) {
+      if (!ids.has(key.split(':')[1])) {
+        this.readers.delete(key)
+        void r.dispose()
+      }
+    }
   }
 }
 
 export const preview = new PreviewEngine()
+
+/** Everything that changes what the audio mix sounds like (clips, gains/fades, mutes, transition dips). */
+function audioFingerprint(p) {
+  return JSON.stringify([
+    p.clips.filter((c) => c.kind === 'audio').map((c) => [c.id, c.trackId, c.assetId, c.start, c.in, c.duration, c.audio, c.linkId]),
+    p.tracks.filter((t) => t.kind === 'audio').map((t) => [t.id, t.muted]),
+    resolveTransitions(p).map((r) => [r.start, r.end, r.a?.linkId, r.b?.linkId]),
+  ])
+}

@@ -30,11 +30,15 @@ can download the results as JSON or CSV.
 npm run bench                         # build → serve dist/ → headed Chrome → all scenarios × 3 runs
 npm run bench -- --scenario export-h264-worker,export-h264-main --runs 5
 npm run bench -- --trace              # also save Chrome traces (open in DevTools › Performance)
-npm run bench:matrix                  # round-trip every container × codec this browser can encode
+npm run bench -- --aac native         # AAC encoder under test: auto (default) | native | wasm
+npm run bench -- --warmup 2 --cooldown 5   # warm-up runs (not counted) and pause between runs
+npm run bench:matrix                  # round-trip each encodable codec (representative pairings)
+npm run bench -- --matrix-all         # …every container × video × audio pairing
 npm run test:ui                       # editor smoke test through the real UI (+ screenshots)
+npm run test:regress                  # regression tests for the audited defects
 sudo npm run bench:server -- --powermetrics   # adds GPU/CPU power (W) + GPU frequency
 ```
-Results go to `bench-results/run-<timestamp>.json|csv`, with one row per run plus a median row per scenario.
+Results go to `bench-results/run-<timestamp>.json|csv`, with one row per run plus a median row per scenario. The median row is the real median run (by conversion time), picked only from runs that verified, ran in a visible tab and didn't overlap another job.
 Scenarios are defined in `bench/scenarios.mjs`. Real media files can go in `bench/fixtures/`, referenced as `fixture: 'file:<name>'`.
 
 ### What is measured
@@ -57,16 +61,16 @@ Use the **Manual pipeline** engine in the Convert dialog (or the `pipe-*` scenar
 - **Composite time is understated.** It only covers 2D canvas command submission. The GPU raster and the canvas → VideoFrame readback happen inside `CanvasSource.add()`, so they're counted under encode wait. Per-frame encoder latency (submit → packet) is the cleaner encode figure.
 - **TBT is often 0 even in main-thread mode**, because the Mediabunny pipeline yields every frame, so no task exceeds 50 ms. The CDP main-thread task time (`cdp_mainTaskMs`) is what separates the two modes. The runner self-tests the long-task probe at startup with 3 × 120 ms injected blocks, which should report TBT ≈ 210 ms.
 - Peak JS heap is only reported for main-thread jobs (`performance.memory` isn't available in workers).
-- "Stream copy" for Conversion jobs is predicted from the settings (same codec and size), not measured.
-- Encode fps for copy and audio jobs is estimated from duration.
-- Short jobs (under the 500 ms sample interval) get only 1–2 CPU/GPU samples. GPU % from `ioreg` covers the whole GPU, not only the browser.
+- "Stream copy" for Conversion jobs is predicted from the settings, not measured: same codec, size and frame rate for video, and same codec, sample rate and channel count for audio.
+- **Encode wait** (`encodeWaitMs`) is time spent *waiting* on the encoders (back-pressure + flush), not encoder busy time. **Pipeline fps** (`pipelineFps`) is frames ÷ total job time, i.e. end-to-end throughput. Conversion frame counts are estimated from duration × fps, and audio-only jobs have none.
+- Short jobs (under the 500 ms sample interval) get only a few CPU/GPU samples. Averages are time-weighted over session start → job end. GPU % from `ioreg` covers the whole GPU, not only the browser.
 
 ## Effects
 - **Library tabs** (left panel): Media · Text · Stickers · Transitions · Filters. Click an item to apply it at the playhead or to the selected clip, or drag it onto the timeline.
 - **Text:** 10 presets (title, subtitle, lower third, callout, quote, caption bar, neon, outline, big & bold, typewriter). Full styling covers font, weight, outline, shadow/glow, box, alignment and spacing, plus reveal animations.
 - **Stickers:** vector shapes, arrows, badges and emoji, all with editable colors.
 - **Transitions:** 49 types in 4 categories: Basic, Smooth & cinematic, Glitch & trendy, Creative. They work on cuts or clip edges, with an animated preview on hover and on the timeline badge. Drag a badge's edge to change its duration. Linked audio dips across the cut.
-- **Video effects (stackable):** 27 effects in 3 groups. Each has its own sliders; reorder them or switch them on and off in the Inspector.
+- **Video effects (stackable):** 28 effects in 3 groups. Each has its own sliders; reorder them or switch them on and off in the Inspector.
   - Cinematic: color grading, grain, vignette, bloom, lens flare, soft glow, anamorphic, depth of field, motion blur, bars.
   - Motion: Ken Burns, camera shake, handheld, bounce, elastic scale, wave, motion trail.
   - Social: RGB split, glitch, pixelate, duotone, invert, scanlines, halftone, noise, neon glow, outline glow, chromatic aberration.

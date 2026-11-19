@@ -14,7 +14,7 @@
     "bench:matrix": "npm run build && node bench/run.mjs --matrix",
     "bench:fx": "npm run build && node bench/fx-catalog.mjs",
     "test:bench-server": "node --test bench-server/probes.test.mjs bench-server/stats.test.mjs bench-server/sessions.test.mjs",
-    "test:regress": "npm run build && node bench/regress.mjs && node --test bench/summary.test.mjs"
+    "test:regress": "npm run build && node bench/regress.mjs && node bench/editor-regress.mjs && node --test bench/summary.test.mjs"
   },
   "dependencies": {
     "@mediabunny/aac-encoder": "^1.65.2",

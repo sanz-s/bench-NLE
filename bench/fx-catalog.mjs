@@ -45,7 +45,7 @@ const run = async (kind, id, spec) => {
   await page.evaluate(([a, s]) => window.__nleBench.buildFxTimeline(a, s), [assetId, spec])
   const r = await page.evaluate((label) => window.__nleBench.exportTimeline({}, { runIn: 'worker', label }), `${kind}:${id}`)
   const ok = r.status === 'done' && r.verify?.ok
-  rows.push({ kind, id, ok, composite_ms: Math.round(r.timings.composite ?? 0), total_ms: Math.round(r.derived.conversionMs), fps: r.derived.encodeFps ? +r.derived.encodeFps.toFixed(1) : null, problem: r.error ?? r.verify?.problems?.join('; ') ?? '' })
+  rows.push({ kind, id, ok, composite_ms: Math.round(r.timings.composite ?? 0), total_ms: Math.round(r.derived.conversionMs), fps: r.derived.pipelineFps ? +r.derived.pipelineFps.toFixed(1) : null, problem: r.error ?? r.verify?.problems?.join('; ') ?? '' })
   process.stdout.write(`${ok ? '✓' : '✗'} ${kind.padEnd(10)} ${id.padEnd(20)} composite ${String(Math.round(r.timings.composite ?? 0)).padStart(5)} ms  total ${Math.round(r.derived.conversionMs)} ms${ok ? '' : `  ${rows.at(-1).problem}`}\n`)
 }
 await run('baseline', 'none', {})

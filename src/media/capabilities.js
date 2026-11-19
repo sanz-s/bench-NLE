@@ -21,7 +21,7 @@ export function getCapabilities(q) {
 async function computeCapabilities(q) {
   registerAllExtensions()
   // default AAC mode: native when the browser has it, otherwise the WASM extension (so AAC is always listed)
-  const aac = await prepareAacEncoder('auto')
+  const aac = await prepareAacEncoder('auto', { sampleRate: q.sampleRate, numberOfChannels: q.channels })
   const result = []
   for (const def of CONTAINERS) {
     if (!def.make) {

@@ -1,7 +1,7 @@
 import { useEffect, useState } from 'react'
 import { liveSample } from '../../bench/serverClient'
 import { toCSV } from '../../bench/metrics'
-import { clearReports, useStore } from '../store'
+import { MAX_OUTPUTS, clearReports, useStore } from '../store'
 import { download } from '../actions'
 import { formatBytes } from '../model'
 import { Badge, Icon } from './ui'
@@ -144,8 +144,9 @@ function ReportCard({ r, url, open, toggle }) {
             <b>{ms(r.derived.conversionMs)}</b>
           </div>
           <div title="Time awaiting encoder submissions + finalize flush">
-            <span>Encode</span>
-            <b>{r.derived.encodeMs === null ? 'pipelined' : ms(r.derived.encodeMs)}</b>
+            <span title="Time waiting on the encoders (back-pressure + flush), not encoder busy time">Encode wait</span>
+            {/* older stored reports use encodeMs / encodeFps */}
+            <b>{(r.derived.encodeWaitMs ?? r.derived.encodeMs ?? null) === null ? 'pipelined' : ms(r.derived.encodeWaitMs ?? r.derived.encodeMs)}</b>
           </div>
           <div title="Media seconds per wall-clock second">
             <span>Speed</span>
@@ -183,12 +184,12 @@ function ReportCard({ r, url, open, toggle }) {
                 v={`${r.settings.width}×${r.settings.height} @ ${r.settings.fps} · ${r.settings.qualityMode === 'level' ? r.settings.quality : `${(r.settings.videoBitrate / 1e6).toFixed(1)} Mb/s`} · hw ${r.settings.hardwareAcceleration}`}
               />
               {r.encoder?.videoEncoderConfig && (
-                <Row k="Encoder" v={`${r.encoder.videoEncoderConfig.codec} · ${r.encoder.videoEncoderConfig.hardwareAcceleration ?? 'default'}`} />
+                <Row k="Encoder" v={`${r.encoder.videoEncoderConfig.codec} · requested ${r.encoder.videoEncoderConfig.hardwareAcceleration ?? 'default'}`} />
               )}
               {r.conversion && (
                 <Row k="Stream copy" v={`video ${fmtBool(r.conversion.copyExpected.video)} · audio ${fmtBool(r.conversion.copyExpected.audio)}`} />
               )}
-              <Row k="Frames" v={`${r.frames} · ${num(r.derived.encodeFps, 1, ' fps')}`} />
+              <Row k="Frames" v={`${r.frames} · ${num(r.derived.pipelineFps ?? r.derived.encodeFps, 1, ' fps end-to-end')}`} />
               <Row k="Worker spawn" v={ms(t.workerSpawn)} />
               <Row k="Setup" v={ms(t.setup)} />
               <Row k="Decode wait" v={ms(t.decodeWait)} />
@@ -232,10 +233,18 @@ function ReportCard({ r, url, open, toggle }) {
               <Row k="Env" v={`${r.env.cores} cores · isolated ${r.env.crossOriginIsolated} · ${r.env.gpu ?? ''}`} />
             </tbody>
           </table>
-          {url && (
+          {url ? (
             <button type="button" className="btn btn-small" onClick={() => download(url, r.output.fileName)}>
               <Icon name="download" size={13} /> Download output
             </button>
+          ) : (
+            r.status === 'done' &&
+            r.target === 'buffer' && (
+              <p className="small muted">
+                Output file released from memory (only the {MAX_OUTPUTS} most recent exports are kept, so old files don&apos;t inflate later memory numbers).
+                Export again to download it.
+              </p>
+            )
           )}
         </div>
       )}

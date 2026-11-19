@@ -54,7 +54,14 @@ export function resolveFilter(f, resolutionScale) {
     grain: Math.min(100, lerp(0, r.grain) + f.grain),
     tint: r.tint ?? null,
     tintAmount: r.tint ? 0.35 * k : 0,
+    /** canvas px per project px: grain is sized in project pixels so preview and export match */
+    scale: resolutionScale,
   }
+}
+
+/** Does the resolved filter need the overlay pass (temperature, tint, grain, vignette)? */
+export function hasFilterOverlays(f) {
+  return Math.abs(f.temperature) > 0.5 || (!!f.tint && f.tintAmount > 0) || f.grain > 0.5 || f.vignette > 0.5
 }
 
 // ------------------------------------------------------------------ overlays (temperature, tint, vignette, grain)
@@ -80,10 +87,13 @@ function getGrainTile() {
 /**
  * Overlays that CSS filters can't express, drawn over `rect` (canvas pixels) after the clip.
  * `t` animates the grain. Caller has already set transform/clip for the layer.
+ * Every overlay's strength is multiplied by the inherited `ctx.globalAlpha` (clip opacity / fades).
  */
 export function drawFilterOverlays(ctx, f, rect, t) {
   const { x, y, w, h } = rect
   if (w <= 0 || h <= 0) return
+  const base = ctx.globalAlpha
+  if (base <= 0) return
   ctx.save()
   ctx.beginPath()
   ctx.rect(x, y, w, h)
@@ -91,28 +101,31 @@ export function drawFilterOverlays(ctx, f, rect, t) {
   if (Math.abs(f.temperature) > 0.5) {
     const a = Math.min(0.45, (Math.abs(f.temperature) / 100) * 0.45)
     ctx.globalCompositeOperation = 'soft-light'
-    ctx.globalAlpha = 1
+    ctx.globalAlpha = base
     ctx.fillStyle = f.temperature > 0 ? `rgba(255,140,30,${a})` : `rgba(30,120,255,${a})`
     ctx.fillRect(x, y, w, h)
   }
   if (f.tint && f.tintAmount > 0) {
     ctx.globalCompositeOperation = 'soft-light'
-    ctx.globalAlpha = f.tintAmount
+    ctx.globalAlpha = base * f.tintAmount
     ctx.fillStyle = f.tint
     ctx.fillRect(x, y, w, h)
   }
   if (f.grain > 0.5) {
     ctx.globalCompositeOperation = 'overlay'
-    ctx.globalAlpha = Math.min(0.5, (f.grain / 100) * 0.5)
+    ctx.globalAlpha = base * Math.min(0.5, (f.grain / 100) * 0.5)
     const pat = ctx.createPattern(getGrainTile(), 'repeat')
     if (pat) {
-      // shift the noise tile each "film frame" (24 fps) so grain moves; pattern origin follows the transform
+      // shift the noise tile each "film frame" (24 fps) so grain moves; pattern origin follows the transform.
+      // The tile is sized in project pixels (× f.scale), so a downscaled preview shows the same grain as the export.
+      const k = f.scale > 0 ? f.scale : 1
       const off = Math.floor(t * 24) * 37
-      const ox = off % 160
-      const oy = (off * 7) % 160
+      const ox = (off % 160) * k
+      const oy = ((off * 7) % 160) * k
       ctx.translate(ox, oy)
+      ctx.scale(k, k)
       ctx.fillStyle = pat
-      ctx.fillRect(x - ox, y - oy, w, h)
+      ctx.fillRect((x - ox) / k, (y - oy) / k, w / k, h / k)
     }
   }
   ctx.restore()
@@ -129,6 +142,7 @@ export function drawFilterOverlays(ctx, f, rect, t) {
     g.addColorStop(0, 'rgba(0,0,0,0)')
     g.addColorStop(1, `rgba(0,0,0,${a})`)
     ctx.globalCompositeOperation = 'source-over'
+    ctx.globalAlpha = base
     ctx.fillStyle = g
     ctx.fillRect(x, y, w, h)
     ctx.restore()

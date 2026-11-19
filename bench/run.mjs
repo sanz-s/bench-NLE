@@ -5,12 +5,15 @@
  *   npm run bench                                   # build, serve dist/, run all scenarios ×3 in headed Chrome
  *   npm run bench -- --scenario export-h264-worker  # one scenario (comma-separate for several)
  *   npm run bench -- --runs 5 --trace               # 5 runs each, save Chrome traces
- *   npm run bench -- --matrix                       # round-trip every encodable container/codec pair
+ *   npm run bench -- --matrix                       # round-trip each encodable codec (representative pairings)
+ *   npm run bench -- --matrix-all                   # …every container × video × audio pairing
  *   npm run bench -- --url http://localhost:5173    # use an already running dev server
  *   flags: --headless  --chromium (bundled Chromium instead of installed Chrome)  --out bench-results
  *          --full-verify (decode every frame/sample of each output; default for --matrix, --quick-verify turns it off)
  *          --fail-on-skip (unsupported scenarios also fail the run)
  *          --aac auto|native|wasm (AAC encoder under test; auto = the browser's own when it has one; recorded per run)
+ *          --warmup N (default 1: unrecorded warm-up runs per scenario)  --cooldown S (default 3 s between runs, plus
+ *          waiting for system CPU < --idle-cpu % when the bench-server is up)
  * Medians use only runs that finished AND passed output verification. Exit code is 1 if any run failed.
  *
  * What it records per run (merged into one row):
@@ -36,12 +39,20 @@ const val = (f, d) => {
   return i >= 0 && argv[i + 1] && !argv[i + 1].startsWith('--') ? argv[i + 1] : d
 }
 const RUNS = Math.max(1, Number(val('runs', 3)))
+// warm-up runs per scenario (JIT, encoder and worker-bundle cold start); executed, logged, never counted
+const WARMUP = Math.max(0, Number(val('warmup', 1)))
+// pause between runs (s), then — with the bench-server up — wait (≤ 20 s) until system CPU is back near idle
+const COOLDOWN_S = Math.max(0, Number(val('cooldown', 3)))
+const IDLE_CPU_PCT = Number(val('idle-cpu', 25))
 const OUT = path.resolve(root, val('out', 'bench-results'))
 const ONLY = val('scenario', null)?.split(',')
 const TRACE = has('trace')
 const HEADLESS = has('headless')
 const BUNDLED = has('chromium')
-const MATRIX = has('matrix')
+// --matrix: each video codec with one audio codec + each audio codec with the first video codec (~90 cases);
+// --matrix-all: every container × video × audio pairing the browser can encode (a few hundred)
+const MATRIX_ALL = has('matrix-all')
+const MATRIX = has('matrix') || MATRIX_ALL
 // full-file decode in the verifier (every frame/sample): on for --matrix, opt-in otherwise (slow on long outputs)
 const FULL_VERIFY = has('full-verify') || (MATRIX && !has('quick-verify'))
 const SERVER = val('server', 'http://127.0.0.1:5199')
@@ -104,6 +115,24 @@ function cdpDelta(a, b) {
     mainStyleMs: d('RecalcStyleDuration'),
     jsHeapUsedMB: (b.JSHeapUsedSize ?? 0) / 1048576,
   }
+}
+
+/** Sleep COOLDOWN_S, then (server up) wait until system CPU is below IDLE_CPU_PCT, at most 20 s. Returns ms waited. */
+async function cooldown(serverOk) {
+  const t0 = Date.now()
+  await new Promise((r) => setTimeout(r, COOLDOWN_S * 1000))
+  if (!serverOk) return Date.now() - t0
+  const until = Date.now() + 20000
+  while (Date.now() < until) {
+    try {
+      const live = await (await fetch(`${SERVER}/live`)).json()
+      if (live.cpuSystemPct != null && live.cpuSystemPct < IDLE_CPU_PCT) break
+    } catch {
+      break
+    }
+    await new Promise((r) => setTimeout(r, 500))
+  }
+  return Date.now() - t0
 }
 
 function supported(caps, s) {
@@ -232,13 +261,14 @@ async function main() {
       const vids = c.video.filter((x) => x.available).map((x) => x.codec)
       const auds = c.audio.filter((x) => x.available).map((x) => x.codec)
       if (c.audioOnly) for (const a of auds) combos.push({ container: c.id, videoCodec: null, audioCodec: a })
+      else if (MATRIX_ALL) for (const vc of vids) for (const a of auds.length ? auds : [null]) combos.push({ container: c.id, videoCodec: vc, audioCodec: a })
       else {
         for (const vc of vids) combos.push({ container: c.id, videoCodec: vc, audioCodec: auds.includes('aac') ? 'aac' : auds.includes('opus') ? 'opus' : (auds[0] ?? null) })
         for (const a of auds) if (vids[0]) combos.push({ container: c.id, videoCodec: vids[0], audioCodec: a })
       }
     }
     const seen = new Set()
-    log(`matrix: ${combos.length} combinations`)
+    log(`matrix${MATRIX_ALL ? ' (all pairings)' : ' (representative pairings; --matrix-all for every one)'}: ${combos.length} candidates`)
     for (const s of combos) {
       const k = `${s.container}/${s.videoCodec}/${s.audioCodec}`
       if (seen.has(k)) continue
@@ -254,20 +284,30 @@ async function main() {
     const list = SCENARIOS.filter((s) => !ONLY || ONLY.includes(s.id))
     if (!list.length) throw new Error(`no scenario matches ${ONLY}. Available: ${SCENARIOS.map((s) => s.id).join(', ')}`)
     for (const sc of list) {
-      const why = supported(caps, sc.settings)
+      // capabilities at THIS scenario's output size (a 4K encode may be unsupported where 1080p works)
+      const [w, h] = [sc.settings.width ?? sc.projectSize?.[0] ?? 1920, sc.settings.height ?? sc.projectSize?.[1] ?? 1080]
+      const scCaps = await page.evaluate((q) => window.__nleBench.capabilities(q), { width: w, height: h, fps: sc.settings.fps ?? 30 })
+      const why = supported(scCaps, sc.settings)
       if (why) {
         log(`skip ${sc.id}: ${why}`)
         summary.push({ scenario: sc.id, status: `skipped (${why})` })
         continue
       }
       const scRows = []
+      for (let i = 0; i < WARMUP; i++) {
+        const { report } = await runOne(sc, -1 - i)
+        allReports.push({ ...report, warmup: true })
+        log(`${sc.id} warm-up ${i + 1}/${WARMUP}: ${report.status} ${Math.round(report.derived.conversionMs)} ms (not counted)`)
+        await cooldown(serverOk)
+      }
       for (let i = 0; i < RUNS; i++) {
+        if (i > 0) await cooldown(serverOk)
         const { report, row } = await runOne(sc, i)
         allReports.push(report)
         rows.push(row)
         scRows.push(row)
         log(
-          `${sc.id} #${i + 1}: ${report.status} conv ${Math.round(report.derived.conversionMs)} ms · enc ${report.derived.encodeMs === null ? 'pipelined' : Math.round(report.derived.encodeMs) + ' ms'} · ${row.realtimeX ?? '—'}× · TBT ${row.mtTbtMs ?? '—'} ms · CPU ${row.sysCpuAvg ?? '—'}% · GPU ${row.gpuAvg ?? '—'}%${report.error ? ` · ${report.error}` : ''}`,
+          `${sc.id} #${i + 1}: ${report.status} conv ${Math.round(report.derived.conversionMs)} ms · enc wait ${report.derived.encodeWaitMs === null ? 'pipelined' : Math.round(report.derived.encodeWaitMs) + ' ms'} · ${row.realtimeX ?? '—'}× · TBT ${row.mtTbtMs ?? '—'} ms · CPU ${row.sysCpuAvg ?? '—'}% · GPU ${row.gpuAvg ?? '—'}%${report.error ? ` · ${report.error}` : ''}`,
         )
       }
       // medians only from runs that finished AND passed output verification
@@ -279,12 +319,13 @@ async function main() {
         summary.push({
           scenario: sc.id,
           'passed/runs': `${sum.passed}/${sum.runs}`,
+          'median run': m.medianOfRun,
           runIn: m.runIn,
           audioEnc: m.audioEncoderImpl,
           convMs: m.conversionMs,
-          encMs: m.encodeMs,
+          encWaitMs: m.encodeWaitMs,
           'x realtime': m.realtimeX,
-          fps: m.encodeFps,
+          pipeFps: m.pipelineFps,
           tbtMs: m.mtTbtMs,
           longestMs: m.mtLongestMs,
           cdpMainMs: m.cdp_mainTaskMs,

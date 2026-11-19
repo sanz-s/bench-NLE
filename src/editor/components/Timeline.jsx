@@ -20,6 +20,7 @@ import {
   deleteSelection,
   endGesture,
   getState,
+  isClipLocked,
   linkedIds,
   placeAsset,
   removeTrack,
@@ -241,7 +242,7 @@ export function Timeline() {
     const orig = new Map(
       st.project.clips
         .filter((c) => ids.includes(c.id))
-        .map((c) => [c.id, { start: c.start, in: c.in, duration: c.duration, trackId: c.trackId, kind: c.kind }]),
+        .map((c) => [c.id, { start: c.start, in: c.in, duration: c.duration, trackId: c.trackId, kind: c.kind, phase: c.phase }]),
     )
     // Listen on window, not via pointer capture: moving a clip to another track re-mounts its element
     // under a different lane, which would drop the capture and lose the release (leaving an overlap).
@@ -285,6 +286,8 @@ export function Timeline() {
     const minDur = 1 / fps
     const o = d.orig.get(d.primary.id)
     let snapped = null
+    /** Edges that didn't snap to another clip land on the frame grid (no sub-frame gaps → no flash frames). */
+    const onFrame = (v) => Math.round(v * fps) / fps
 
     if (d.mode === 'move') {
       let delta = dx
@@ -303,6 +306,7 @@ export function Timeline() {
         }
         if (snapped !== null) delta += best
       }
+      if (snapped === null) delta = onFrame(o.start + delta) - o.start
       const minStart = Math.min(...[...d.orig.values()].map((x) => x.start))
       if (minStart + delta < 0) {
         delta = -minStart
@@ -339,6 +343,7 @@ export function Timeline() {
           ns = r.v
           snapped = r.snapped
         }
+        if (snapped === null) ns = onFrame(ns)
         ns = Math.min(ns, o.start + o.duration - minDur)
         if (media) ns = Math.max(ns, o.start - o.in)
         ns = Math.max(0, ns, o.start + d.minStartDelta)
@@ -350,6 +355,8 @@ export function Timeline() {
             c.start = oc.start + delta
             c.in = Math.max(0, oc.in + delta)
             c.duration = oc.duration - delta
+            // a split half keeps its animation locked to the content it shows
+            if (oc.phase !== undefined) c.phase = Math.max(0, oc.phase + delta)
           }
         }
         setTrimTip({ x: e.clientX, y: e.clientY, text: `${signed(delta)} · ${formatDuration(o.duration - delta)}` })
@@ -360,6 +367,7 @@ export function Timeline() {
           ne = r.v
           snapped = r.snapped
         }
+        if (snapped === null) ne = onFrame(ne)
         ne = Math.max(ne, o.start + minDur)
         if (media) ne = Math.min(ne, o.start + srcDur - o.in)
         ne = Math.min(ne, o.start + o.duration + d.maxEndDelta)
@@ -486,6 +494,13 @@ export function Timeline() {
   }
 
   // ---------------------------------------------------------------- drop from bin / OS
+  /** Drop position: snapped to an edit point, else to the frame grid. */
+  const dropTime = (e, st) => {
+    const t = timeAtClientX(e.clientX)
+    const r = snapping !== e.shiftKey ? snapValue(t, snapCandidates(st.project, new Set(), st.time), SNAP_PX / zoom) : { snapped: null }
+    return r.snapped ?? Math.round(t * st.project.fps) / st.project.fps
+  }
+
   const clearDropHints = () => {
     setGhost(null)
     setDropMark(null)
@@ -508,7 +523,7 @@ export function Timeline() {
       setDropClip(c?.id ?? null)
       if (!c) return
     } else {
-      if (snapping !== e.shiftKey) t = snapValue(t, snapCandidates(st.project, new Set(), st.time), SNAP_PX / zoom).v
+      t = dropTime(e, st)
       const dur = fx.kind === 'text' ? (TEXT_PRESETS.find((x) => x.id === fx.presetId)?.make(1920, 1080).duration ?? 4) : fx.kind === 'sticker' ? 3 : 5
       setGhost({ trackId: track.id, start: t, duration: dur })
     }
@@ -546,9 +561,8 @@ export function Timeline() {
     if (!isAsset && !isFiles) return
     e.preventDefault()
     e.dataTransfer.dropEffect = 'copy'
-    let t = timeAtClientX(e.clientX)
     const st = getState()
-    if (snapping !== e.shiftKey) t = snapValue(t, snapCandidates(st.project, new Set(), st.time), SNAP_PX / zoom).v
+    const t = dropTime(e, st)
     const asset = dragState.assetId ? assetById.get(dragState.assetId) : undefined
     setGhost({ trackId: track.id, start: t, duration: asset ? asset.info.duration : 5 })
   }
@@ -823,6 +837,8 @@ function TransitionBadge({ rt, zoom, selected }) {
     e.stopPropagation()
     e.preventDefault()
     setState({ selectedTransitionId: rt.tr.id, selection: [], sideTab: 'inspector' })
+    const p0 = getState().project
+    if ((rt.a && isClipLocked(p0, rt.a.id)) || (rt.b && isClipLocked(p0, rt.b.id))) return
     const x0 = e.clientX
     const d0 = rt.tr.duration
     // cut transitions are centred, so each px moves both edges; edge transitions grow from their anchor
@@ -836,13 +852,18 @@ function TransitionBadge({ rt, zoom, selected }) {
         if (t) t.duration = Math.round(d * 100) / 100
       })
     }
+    // every way a drag can end closes the gesture (a lost release used to leave it open and revert later edits)
     const up = () => {
       window.removeEventListener('pointermove', move)
       window.removeEventListener('pointerup', up)
+      window.removeEventListener('pointercancel', up)
+      window.removeEventListener('blur', up)
       endGesture('Change transition duration')
     }
     window.addEventListener('pointermove', move)
     window.addEventListener('pointerup', up)
+    window.addEventListener('pointercancel', up)
+    window.addEventListener('blur', up)
   }
   const canLeft = !!rt.a // pair or out-edge: left handle changes length
   const canRight = !!rt.b

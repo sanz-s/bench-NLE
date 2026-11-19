@@ -1,11 +1,20 @@
+/**
+ * Derived numbers. Names say what they measure:
+ *  - encodeWaitMs: time the pipeline WAITED on the encoders (awaiting source.add() = queue back-pressure, plus the
+ *    finalize flush). It is not encoder busy time: a decode-bound job shows ~0 while the encoder works. For encoder
+ *    work use encoder.encoderSpan and encoder.latency*. null for Conversion jobs (pipelined inside Mediabunny).
+ *  - pipelineFps: output frames / total job time (end-to-end throughput, not encoder fps). Conversion frame counts
+ *    are estimated from duration × fps.
+ */
 export function deriveMetrics(r, wallMs) {
   const t = r.timings
-  const encodeMs =
+  const encodeWaitMs =
     t.videoEncodeWait !== undefined || t.audioEncodeWait !== undefined ? (t.videoEncodeWait ?? 0) + (t.audioEncodeWait ?? 0) + (t.finalize ?? 0) : null
+  const pipelineFps = r.frames > 0 && t.total > 0 ? r.frames / (t.total / 1000) : null
   return {
     conversionMs: t.total,
-    encodeMs,
-    encodeFps: r.frames > 0 && t.total > 0 ? r.frames / (t.total / 1000) : null,
+    encodeWaitMs,
+    pipelineFps,
     realtimeFactor: t.total > 0 ? r.mediaDuration / (t.total / 1000) : null,
     wallMs,
   }
@@ -34,16 +43,15 @@ export function flattenReport(r) {
     outRes: `${r.settings.width}x${r.settings.height}`,
     outFps: r.settings.fps,
     quality: r.settings.qualityMode === 'level' ? r.settings.quality : `${Math.round(r.settings.videoBitrate / 1000)}k`,
-    hwAccel: r.settings.hardwareAcceleration,
+    hwPreference: r.settings.hardwareAcceleration, // what was REQUESTED; the browser doesn't say which path ran
     encoderCodec: r.encoder?.videoEncoderConfig?.codec ?? null,
-    encoderHw: r.encoder?.videoEncoderConfig?.hardwareAcceleration ?? null,
     audioEncoderImpl: r.audioEncoder?.impl ?? null,
     aacRequested: r.audioEncoder?.requested ?? null,
     copyVideo: r.conversion?.copyExpected.video ?? null,
     copyAudio: r.conversion?.copyExpected.audio ?? null,
     frames: r.frames,
     conversionMs: round(r.derived.conversionMs),
-    encodeMs: round(r.derived.encodeMs),
+    encodeWaitMs: round(r.derived.encodeWaitMs ?? r.derived.encodeMs),
     wallMs: round(r.derived.wallMs),
     workerSpawnMs: round(r.timings.workerSpawn),
     setupMs: round(r.timings.setup),
@@ -54,7 +62,7 @@ export function flattenReport(r) {
     audioEncodeWaitMs: round(r.timings.audioEncodeWait),
     finalizeMs: round(r.timings.finalize),
     firstProgressMs: round(r.timings.timeToFirstProgress),
-    encodeFps: round(r.derived.encodeFps, 1),
+    pipelineFps: round(r.derived.pipelineFps ?? r.derived.encodeFps, 1),
     realtimeX: round(r.derived.realtimeFactor, 2),
     encLatencyAvgMs: round(r.encoder?.latencyAvg),
     encLatencyP95Ms: round(r.encoder?.latencyP95),

@@ -43,8 +43,27 @@ test('exit code is non-zero when any run failed or failed verification', () => {
   assert.equal(exitCode([row(1)], { skipped: 2, failOnSkip: true }), 1)
 })
 
-test('medianRow is column-wise and keeps non-numeric fields from the first row', () => {
+test('medianRow picks the median run and keeps its non-numeric fields', () => {
   const m = medianRow([row(1, { runIn: 'worker' }), row(3, { runIn: 'worker' }), row(2, { runIn: 'worker' })])
   assert.equal(m.conversionMs, 2)
   assert.equal(m.runIn, 'worker')
+})
+
+test('the median row is one real run, not a mix of columns (audit §3.10)', () => {
+  const s = summarizeScenario([row(100, { run: 1, cpu: 50 }), row(300, { run: 2, cpu: 10 }), row(200, { run: 3, cpu: 90 })])
+  // column-wise this would be conversionMs 200 with cpu 50 (from run 1): a row that never happened
+  assert.equal(s.median.conversionMs, 200)
+  assert.equal(s.median.cpu, 90)
+  assert.equal(s.median.medianOfRun, 3)
+  // even count: lower middle
+  assert.equal(summarizeScenario([row(10, { run: 1 }), row(20, { run: 2 })]).median.medianOfRun, 1)
+})
+
+test('hidden-tab and overlapping runs are left out of medians (audit §3.4, §3.7)', () => {
+  const s = summarizeScenario([row(100), row(5, { tabHiddenMs: 1200 }), row(6, { overlappingJobs: 1 }), row(120)])
+  assert.equal(s.passed, 2)
+  assert.equal(s.failed, 2)
+  assert.match(s.firstFailure, /tab hidden/)
+  assert.ok(!runPassed(row(1, { overlappingJobs: 2 })))
+  assert.ok(runPassed(row(1, { tabHiddenMs: 0, overlappingJobs: null })))
 })

@@ -198,6 +198,9 @@ const fmtPct = (v, d = 0) => (v == null || !isFinite(v) ? '—' : `${v.toFixed(d
 const fmtX = (v) => (v == null || !isFinite(v) ? '—' : `${v.toFixed(v >= 10 ? 0 : 1)}×`)
 const fmtBytes = (b) => (b == null ? '—' : b < 1048576 ? `${(b / 1024).toFixed(0)} KB` : `${(b / 1048576).toFixed(b < 10485760 ? 2 : 1)} MB`)
 const fmtTime = (ts) => new Date(ts).toLocaleString(undefined, { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit', second: '2-digit' })
+// derived metric names changed (encodeMs → encodeWaitMs, encodeFps → pipelineFps); older records keep the old ones
+const encWait = (r) => r.derived?.encodeWaitMs ?? r.derived?.encodeMs ?? null
+const pipeFps = (r) => r.derived?.pipelineFps ?? r.derived?.encodeFps ?? null
 const fmtSec = (ms) => `${(ms / 1000).toFixed(ms < 10000 ? 1 : 0)}s`
 
 let health = null
@@ -670,7 +673,7 @@ const COLS = [
   { key: 'out', label: 'Output', get: (r) => `${r.report.settings.container} · ${r.report.settings.videoCodec ?? '—'}/${r.report.settings.audioCodec ?? '—'}`, fmt: esc },
   { key: 'runIn', label: 'Run in', get: (r) => r.report.runIn, fmt: (v) => (v === 'main' ? 'main' : 'worker') },
   { key: 'conv', label: 'Conversion', num: true, get: (r) => r.report.derived?.conversionMs, fmt: fmtMs },
-  { key: 'enc', label: 'Encode', num: true, get: (r) => r.report.derived?.encodeMs, fmt: (v) => (v == null ? '<span class="muted">pipelined</span>' : fmtMs(v)) },
+  { key: 'enc', label: 'Encode wait', num: true, get: (r) => r.report.derived?.encodeWaitMs ?? r.report.derived?.encodeMs, fmt: (v) => (v == null ? '<span class="muted">pipelined</span>' : fmtMs(v)) },
   { key: 'speed', label: 'Speed', num: true, get: (r) => r.report.derived?.realtimeFactor, fmt: fmtX },
   { key: 'tbt', label: 'Main TBT', num: true, get: (r) => r.report.mainThread?.tbtMs, fmt: fmtMs },
   { key: 'longest', label: 'Longest task', num: true, get: (r) => r.report.mainThread?.longestTaskMs, fmt: fmtMs },
@@ -820,8 +823,8 @@ async function openDetail(id) {
     ${r.status !== 'done' ? `<div class="pad bad">✗ ${esc(r.status)}: ${esc(r.error)}</div>` : ''}
     <div class="tiles">
       ${liveTile('Conversion time', fmtMs(r.derived?.conversionMs), `wall ${fmtMs(r.derived?.wallMs)}`)}
-      ${liveTile('Encode time', r.derived?.encodeMs == null ? 'pipelined' : fmtMs(r.derived.encodeMs), r.derived?.encodeMs == null ? 'Conversion API: not separable' : 'submit/backpressure + flush')}
-      ${liveTile('Speed', fmtX(r.derived?.realtimeFactor), `${r.frames} frames · ${r.derived?.encodeFps ? r.derived.encodeFps.toFixed(0) + ' fps' : '—'}`)}
+      ${liveTile('Encode wait', encWait(r) == null ? 'pipelined' : fmtMs(encWait(r)), encWait(r) == null ? 'Conversion API: not separable' : 'time waiting on encoders (back-pressure + flush), not encoder busy time')}
+      ${liveTile('Speed', fmtX(r.derived?.realtimeFactor), `${r.frames} frames · ${pipeFps(r) ? pipeFps(r).toFixed(0) + ' fps end-to-end' : '—'}`)}
       ${liveTile('Encoder latency', fmtMs(enc.latencyAvg), enc.latencyP95 != null ? `p95 ${fmtMs(enc.latencyP95)}` : r.engine === 'conversion' ? 'not exposed by Conversion API' : '')}
       ${liveTile('Main TBT', fmtMs(mt.tbtMs), `${mt.longTasks ?? 0} long tasks · longest ${fmtMs(mt.longestTaskMs)}`, css('--c-main'))}
       ${liveTile('CPU avg', fmtPct(sys.cpuSystemPct?.avg), `max ${fmtPct(sys.cpuSystemPct?.max)}`, css('--c-cpu'))}
@@ -888,7 +891,7 @@ async function openCompare() {
   el.hidden = false
   const metrics = [
     ['Conversion time', 'lower is better', (r) => r.report.derived?.conversionMs, fmtMs],
-    ['Encode time', 'lower is better', (r) => r.report.derived?.encodeMs, fmtMs],
+    ['Encode wait', 'lower is better', (r) => encWait(r.report), fmtMs],
     ['Speed (× real time)', 'higher is better', (r) => r.report.derived?.realtimeFactor, fmtX],
     ['Main-thread TBT', 'lower is better', (r) => r.report.mainThread?.tbtMs, fmtMs],
     ['Main-thread blocked total', 'lower is better', (r) => r.series.mainThread.reduce((a, b) => a + (b.blockedMs || 0), 0), fmtMs],
@@ -945,7 +948,7 @@ function flat(r) {
     id: r.id, started: new Date(r.meta.startedAt).toISOString(), source: r.source, type: r.meta.kind, job: p.label, status: p.status,
     engine: p.engine, runIn: p.runIn, container: p.settings.container, videoCodec: p.settings.videoCodec, audioCodec: p.settings.audioCodec,
     width: p.settings.width, height: p.settings.height, fps: p.settings.fps, hw: p.settings.hardwareAcceleration,
-    conversionMs: p.derived?.conversionMs, encodeMs: p.derived?.encodeMs, realtimeX: p.derived?.realtimeFactor, encodeFps: p.derived?.encodeFps,
+    conversionMs: p.derived?.conversionMs, encodeWaitMs: encWait(p), realtimeX: p.derived?.realtimeFactor, pipelineFps: pipeFps(p),
     ...Object.fromEntries(STAGES.map(([k]) => [`${k}Ms`, p.timings?.[k]])),
     encLatencyAvgMs: p.encoder?.latencyAvg, encLatencyP95Ms: p.encoder?.latencyP95,
     mtLongTasks: p.mainThread?.longTasks, mtTbtMs: p.mainThread?.tbtMs, mtLongestMs: p.mainThread?.longestTaskMs, mtBlockedPct: p.mainThread?.blockedPct,

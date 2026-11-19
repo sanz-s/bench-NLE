@@ -14,6 +14,7 @@ import {
   beginGesture,
   deleteTransition,
   endGesture,
+  isClipLocked,
   setProjectSettings,
   updateClip,
   updateGesture,
@@ -115,6 +116,7 @@ export function Inspector() {
         easing={tr.tr.easing}
         kind={tr.a && tr.b ? 'cut' : tr.b ? 'in' : 'out'}
         maxDur={tr.a && tr.b ? Math.min(tr.a.duration, tr.b.duration) : (tr.a ?? tr.b).duration}
+        locked={(!!tr.a && isClipLocked(project, tr.a)) || (!!tr.b && isClipLocked(project, tr.b))}
       />
     )
   const clips = project.clips.filter((c) => selection.includes(c.id))
@@ -147,131 +149,141 @@ function ClipInspector({ clip, project }) {
         : clip.kind === 'adjustment'
           ? 'Adjustment layer'
           : (asset?.name ?? 'Clip')
+  const locked = isClipLocked(project, clip)
+  const trackName = project.tracks.find((t) => t.id === clip.trackId)?.name
   return (
     <div className="inspector">
       <div className="inspector-title">
         <span className={`kind-chip kind-${clip.kind}`}>{clip.kind}</span>
         <strong title={title}>{title}</strong>
       </div>
-      <Section title="Timing">
-        <dl className="kv">
-          <dt>Start</dt>
-          <dd>{formatDuration(clip.start)}</dd>
-          <dt>Duration</dt>
-          <dd>{formatDuration(clip.duration)}</dd>
-          {(clip.kind === 'video' || clip.kind === 'audio') && (
-            <>
-              <dt>Source in</dt>
-              <dd>{formatDuration(clip.in)}</dd>
-            </>
-          )}
-        </dl>
-      </Section>
-      {clip.kind === 'text' && clip.text && <TextSection clip={clip} project={project} />}
-      {clip.kind === 'sticker' && clip.sticker && <StickerSection clip={clip} />}
-      {transformable && (
-        <Section title="Transform">
-          <NumberField
-            label="X"
-            value={clip.transform.x}
-            defaultValue={0}
-            suffix="px"
-            onChange={edit('Position X', (c, v) => (c.transform.x = Math.round(v)))}
-          />
-          <NumberField
-            label="Y"
-            value={clip.transform.y}
-            defaultValue={0}
-            suffix="px"
-            onChange={edit('Position Y', (c, v) => (c.transform.y = Math.round(v)))}
-          />
-          <NumberField
-            label="Scale"
-            value={clip.transform.scale}
-            displayScale={100}
-            min={0.01}
-            max={10}
-            defaultValue={1}
-            suffix="%"
-            onChange={edit('Scale', (c, v) => (c.transform.scale = v))}
-          />
-          <NumberField
-            label="Rotation"
-            value={clip.rotation ?? 0}
-            min={-360}
-            max={360}
-            defaultValue={0}
-            suffix="°"
-            onChange={edit('Rotation', (c, v) => (c.rotation = Math.round(v * 10) / 10))}
-          />
-          <NumberField
-            label="Opacity"
-            value={clip.transform.opacity}
-            displayScale={100}
-            min={0}
-            max={1}
-            defaultValue={1}
-            suffix="%"
-            onChange={edit('Opacity', (c, v) => (c.transform.opacity = v))}
-          />
-        </Section>
+      {locked && (
+        <p className="small muted pad" role="status" data-testid="inspector-locked">
+          🔒 Track {trackName} is locked: this clip is read-only. Unlock the track to edit it.
+        </p>
       )}
-      {clip.kind === 'adjustment' && (
-        <Section title="Layer">
-          <NumberField
-            label="Opacity"
-            value={clip.transform.opacity}
-            displayScale={100}
-            min={0}
-            max={1}
-            defaultValue={1}
-            suffix="%"
-            onChange={edit('Opacity', (c, v) => (c.transform.opacity = v))}
-          />
-          <p className="small muted">Filters everything on the tracks below while it plays.</p>
+      {/* a disabled fieldset makes every control inside read-only; the store enforces the lock as well */}
+      <fieldset disabled={locked} aria-disabled={locked} className="inspector-fields" style={{ border: 0, padding: 0, margin: 0, minWidth: 0 }}>
+        <Section title="Timing">
+          <dl className="kv">
+            <dt>Start</dt>
+            <dd>{formatDuration(clip.start)}</dd>
+            <dt>Duration</dt>
+            <dd>{formatDuration(clip.duration)}</dd>
+            {(clip.kind === 'video' || clip.kind === 'audio') && (
+              <>
+                <dt>Source in</dt>
+                <dd>{formatDuration(clip.in)}</dd>
+              </>
+            )}
+          </dl>
         </Section>
-      )}
-      {visual && <EffectsSection clip={clip} />}
-      {visual && <FilterSection clip={clip} />}
-      {transformable && <AnimationSection clip={clip} />}
-      {visual && <ClipTransitionsSection clip={clip} project={project} />}
-      {clip.kind === 'audio' && (
-        <Section title="Audio">
-          <NumberField
-            label="Gain"
-            value={clip.audio.gain > 0 ? 20 * Math.log10(clip.audio.gain) : -60}
-            min={-60}
-            max={12}
-            step={0.5}
-            precision={1}
-            defaultValue={0}
-            suffix="dB"
-            onChange={(v, final) => edit('Gain', (c, db) => (c.audio.gain = db <= -60 ? 0 : 10 ** (db / 20)))(v, final)}
-          />
-          <NumberField
-            label="Fade in"
-            value={clip.audio.fadeIn}
-            min={0}
-            max={clip.duration}
-            step={0.05}
-            precision={2}
-            defaultValue={0}
-            suffix="s"
-            onChange={edit('Fade in', (c, v) => (c.audio.fadeIn = v))}
-          />
-          <NumberField
-            label="Fade out"
-            value={clip.audio.fadeOut}
-            min={0}
-            max={clip.duration}
-            step={0.05}
-            precision={2}
-            defaultValue={0}
-            suffix="s"
-            onChange={edit('Fade out', (c, v) => (c.audio.fadeOut = v))}
-          />
-        </Section>
-      )}
+        {clip.kind === 'text' && clip.text && <TextSection clip={clip} project={project} />}
+        {clip.kind === 'sticker' && clip.sticker && <StickerSection clip={clip} />}
+        {transformable && (
+          <Section title="Transform">
+            <NumberField
+              label="X"
+              value={clip.transform.x}
+              defaultValue={0}
+              suffix="px"
+              onChange={edit('Position X', (c, v) => (c.transform.x = Math.round(v)))}
+            />
+            <NumberField
+              label="Y"
+              value={clip.transform.y}
+              defaultValue={0}
+              suffix="px"
+              onChange={edit('Position Y', (c, v) => (c.transform.y = Math.round(v)))}
+            />
+            <NumberField
+              label="Scale"
+              value={clip.transform.scale}
+              displayScale={100}
+              min={0.01}
+              max={10}
+              defaultValue={1}
+              suffix="%"
+              onChange={edit('Scale', (c, v) => (c.transform.scale = v))}
+            />
+            <NumberField
+              label="Rotation"
+              value={clip.rotation ?? 0}
+              min={-360}
+              max={360}
+              defaultValue={0}
+              suffix="°"
+              onChange={edit('Rotation', (c, v) => (c.rotation = Math.round(v * 10) / 10))}
+            />
+            <NumberField
+              label="Opacity"
+              value={clip.transform.opacity}
+              displayScale={100}
+              min={0}
+              max={1}
+              defaultValue={1}
+              suffix="%"
+              onChange={edit('Opacity', (c, v) => (c.transform.opacity = v))}
+            />
+          </Section>
+        )}
+        {clip.kind === 'adjustment' && (
+          <Section title="Layer">
+            <NumberField
+              label="Opacity"
+              value={clip.transform.opacity}
+              displayScale={100}
+              min={0}
+              max={1}
+              defaultValue={1}
+              suffix="%"
+              onChange={edit('Opacity', (c, v) => (c.transform.opacity = v))}
+            />
+            <p className="small muted">Filters everything on the tracks below while it plays.</p>
+          </Section>
+        )}
+        {visual && <EffectsSection clip={clip} />}
+        {visual && <FilterSection clip={clip} />}
+        {transformable && <AnimationSection clip={clip} />}
+        {visual && <ClipTransitionsSection clip={clip} project={project} />}
+        {clip.kind === 'audio' && (
+          <Section title="Audio">
+            <NumberField
+              label="Gain"
+              value={clip.audio.gain > 0 ? 20 * Math.log10(clip.audio.gain) : -60}
+              min={-60}
+              max={12}
+              step={0.5}
+              precision={1}
+              defaultValue={0}
+              suffix="dB"
+              onChange={(v, final) => edit('Gain', (c, db) => (c.audio.gain = db <= -60 ? 0 : 10 ** (db / 20)))(v, final)}
+            />
+            <NumberField
+              label="Fade in"
+              value={clip.audio.fadeIn}
+              min={0}
+              max={clip.duration}
+              step={0.05}
+              precision={2}
+              defaultValue={0}
+              suffix="s"
+              onChange={edit('Fade in', (c, v) => (c.audio.fadeIn = v))}
+            />
+            <NumberField
+              label="Fade out"
+              value={clip.audio.fadeOut}
+              min={0}
+              max={clip.duration}
+              step={0.05}
+              precision={2}
+              defaultValue={0}
+              suffix="s"
+              onChange={edit('Fade out', (c, v) => (c.audio.fadeOut = v))}
+            />
+          </Section>
+        )}
+      </fieldset>
     </div>
   )
 }
@@ -723,51 +735,65 @@ function TransitionInspector(props) {
         <span className="kind-chip kind-transition">transition</span>
         <strong>{transitionLabel(props.type)}</strong>
         <div className="topbar-spacer" />
-        <IconButton icon="trash" label="Delete transition" shortcut="Del" onClick={() => deleteTransition(props.id)} />
+        <IconButton
+          icon="trash"
+          label="Delete transition"
+          shortcut="Del"
+          onClick={() => deleteTransition(props.id)}
+          disabled={props.locked}
+          disabledReason="Track is locked"
+        />
       </div>
-      <Section title="Transition">
-        <SelectRow
-          label="Type"
-          value={props.type}
-          options={TRANSITIONS.map((t) => ({ id: t.id, label: t.label }))}
-          onChange={(v) => updateTransition(props.id, 'Change transition', { type: v })}
-        />
-        <NumberField
-          label="Duration"
-          value={props.duration}
-          min={0.1}
-          max={props.maxDur}
-          step={0.05}
-          precision={2}
-          defaultValue={0.5}
-          suffix="s"
-          onChange={(v, final) => {
-            updateGesture((p) => {
-              const t = (p.transitions ?? []).find((x) => x.id === props.id)
-              if (t) t.duration = Math.round(v * 100) / 100
-            })
-            if (final) endGesture('Transition duration')
-          }}
-        />
-        <SelectRow
-          label="Easing"
-          value={props.easing}
-          options={[
-            { id: 'ease-in-out', label: 'Ease in-out' },
-            { id: 'linear', label: 'Linear' },
-            { id: 'ease-in', label: 'Ease in' },
-            { id: 'ease-out', label: 'Ease out' },
-          ]}
-          onChange={(v) => updateTransition(props.id, 'Transition easing', { easing: v })}
-        />
-        <p className="small muted">
-          {props.kind === 'cut'
-            ? 'Plays across the cut: half before, half after. Uses extra source frames when available. Linked audio dips across the cut.'
-            : props.kind === 'in'
-              ? 'Transition in at the start of the clip.'
-              : 'Transition out at the end of the clip.'}
+      {props.locked && (
+        <p className="small muted pad" role="status" data-testid="inspector-locked">
+          🔒 This transition is on a locked track: read-only. Unlock the track to edit it.
         </p>
-      </Section>
+      )}
+      <fieldset disabled={props.locked} className="inspector-fields" style={{ border: 0, padding: 0, margin: 0, minWidth: 0 }}>
+        <Section title="Transition">
+          <SelectRow
+            label="Type"
+            value={props.type}
+            options={TRANSITIONS.map((t) => ({ id: t.id, label: t.label }))}
+            onChange={(v) => updateTransition(props.id, 'Change transition', { type: v })}
+          />
+          <NumberField
+            label="Duration"
+            value={props.duration}
+            min={0.1}
+            max={props.maxDur}
+            step={0.05}
+            precision={2}
+            defaultValue={0.5}
+            suffix="s"
+            onChange={(v, final) => {
+              updateGesture((p) => {
+                const t = (p.transitions ?? []).find((x) => x.id === props.id)
+                if (t) t.duration = Math.round(v * 100) / 100
+              })
+              if (final) endGesture('Transition duration')
+            }}
+          />
+          <SelectRow
+            label="Easing"
+            value={props.easing}
+            options={[
+              { id: 'ease-in-out', label: 'Ease in-out' },
+              { id: 'linear', label: 'Linear' },
+              { id: 'ease-in', label: 'Ease in' },
+              { id: 'ease-out', label: 'Ease out' },
+            ]}
+            onChange={(v) => updateTransition(props.id, 'Transition easing', { easing: v })}
+          />
+          <p className="small muted">
+            {props.kind === 'cut'
+              ? 'Plays across the cut: half before, half after. Uses extra source frames when available. Linked audio dips across the cut.'
+              : props.kind === 'in'
+                ? 'Transition in at the start of the clip.'
+                : 'Transition out at the end of the clip.'}
+          </p>
+        </Section>
+      </fieldset>
     </div>
   )
 }

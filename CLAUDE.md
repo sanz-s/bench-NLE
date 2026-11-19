@@ -29,8 +29,16 @@ A browser-based non-linear video editor (NLE) whose purpose is **benchmarking Me
   - `--trace` saves Chrome traces.
   - `--headless` / `--chromium` choose a different browser setup.
   - `--aac auto|native|wasm` picks the AAC encoder under test (default auto). Each row records `audioEncoderImpl`.
+  - `--warmup N` (default 1) adds unrecorded warm-up runs per scenario.
+  - `--cooldown S` (default 3) pauses between runs; with the bench-server up, it also waits ≤ 20 s for system CPU < `--idle-cpu` (25 %).
+  - Capabilities are checked at each scenario's own output size, so an unsupported 4K encode is skipped, not failed.
+  - Fixtures: the `h264_*` ones are smooth synthetic content (easy to encode, 1 s GOP), kept for comparability. `camera_1080p30` adds panning fine detail, per-frame sensor noise and a 2 s GOP (`spec.content: 'camera'`, `spec.keyFrameInterval`), and the `*-camera-*` scenarios use it. It's still synthetic. For real footage, put files in `bench/fixtures/` and use `fixture: 'file:<name>'`.
+  - `--matrix` tests representative pairings (each video codec with one audio codec, plus each audio codec with the first video codec). `--matrix-all` tests every container × video × audio pairing.
 - `npm run bench:matrix`: round-trips every encodable container × codec (convert, then re-probe).
-- `npm run test:regress`: regression tests for the defects found by the 2026-11-18 audits (`bench/regress.mjs`: fractional audio tails, copy ignoring audio settings, verifier false positives) plus `bench/summary.test.mjs`. Each test failed on the unfixed code.
+- `npm run test:regress`: regression tests for the defects found by the 2026-11-18 audits. Each test failed on the unfixed code, except guard tests that are marked as such.
+  - `bench/regress.mjs`: export and measurement. Fractional audio tails, copy ignoring audio settings, verifier false positives and the copy heuristic (R1), AAC choice, tab visibility, failed-write cleanup (F4).
+  - `bench/editor-regress.mjs`: 33 editor/render tests (E1–E20, F5–F7, F10, job queue). Flags: `--dist <dir> --port <n> --only <substr> --headed`. It uses `window.__nleBench.editor`, which exposes the store, model, compositor and other modules to tests.
+  - `bench/summary.test.mjs`: median and acceptance logic.
 - `npm run test:ui`: UI smoke tests through the real UI. `bench/ui-smoke.mjs` covers editing; `bench/effects-smoke.mjs` covers text, stickers, filters, transitions, copy/paste and effects exports. Screenshots go to `bench-results/ui-smoke/` and `bench-results/effects-smoke/`.
 - `node bench/showcase.mjs [--files a b c] [--export] [--no-sfx] [--test]`: opens headed Chrome on the running dev server (or starts one), imports 3 videos (or waits for you to), builds the all-tools showcase edit (`buildShowcase` in `harness.js`) and leaves the window open. It also imports the synthesized SFX kit from `bench/sfx/` (`node bench/make-sfx.mjs` regenerates it); any asset named `sfx-<name>.wav` is placed on A2+. Export only with `--export`.
 - `npx playwright install chromium` is needed only for `--chromium`. The default uses the installed Chrome.
@@ -38,7 +46,7 @@ A browser-based non-linear video editor (NLE) whose purpose is **benchmarking Me
 ## Architecture (data flow)
 - `src/media/`: the Mediabunny-only layer, with no React. It runs in both the main thread and the worker.
   - `extensions.js` `registerAllExtensions()` must run once **in every JS context** (main thread and each worker) before any decode or encode.
-    - It registers everything **except the AAC encoder**. Mediabunny tries custom encoders before native WebCodecs, so `prepareAacEncoder(mode)` registers the WASM AAC encoder only for `settings.aacEncoder` = `'wasm'`, or `'auto'` (the default) when the browser has no native AAC. `runJob` calls it for every job.
+    - It registers everything **except the AAC encoder**. Mediabunny tries custom encoders before native WebCodecs, so `prepareAacEncoder(mode, config)` registers the WASM AAC encoder only for `settings.aacEncoder` = `'wasm'`, or `'auto'` (the default) when the browser has no native AAC **for that job's sample rate and channel count**. `runJob` calls it for every job.
     - Each report carries `audioEncoder: { codec, impl: native-webcodecs | wasm-extension | mediabunny-pcm | copy, requested }`.
     - Workers are created per job, so they always get the requested mode. The main thread can't unregister, so after one `'wasm'` main-thread job, later main-thread jobs also use WASM, and the report says so (`note`).
   - `formats.js` maps container ids to Mediabunny `*OutputFormat` classes.
@@ -72,14 +80,15 @@ A browser-based non-linear video editor (NLE) whose purpose is **benchmarking Me
   - **Sampling window:** session start → the client's `job-end` mark (`jobRunner` sends it right after the job). The server takes one last sample then and ignores later ones, so the main-thread wait, verification and the report never dilute the averages. Each sample carries `dtMs`, and summary averages are **time-weighted** (p95/max per sample). The summary has `sampledMs`, `sampleWindow` and `averaging`.
   - **Overlap:** sessions sampled at the same time are flagged on both sides (`summary.overlap`), because system CPU/GPU/power are shared. Each session has its own process filter (one snapshot, one view per filter), so another browser's job doesn't steal its numbers.
   - **Orphans:** a session with no request for `BENCH_SESSION_TIMEOUT_MS` (default 180 s) expires (`summary.orphaned`). Its samples after the last request are dropped, and it leaves the Live view.
-  - `BENCH_RESULTS_DIR` overrides `bench-results/` (used by the tests). `method` also records the CPU, RAM, GPU and power sources. The dashboard detail shows all of them, with a ⚠ for name-match and older records.
+  - `BENCH_RESULTS_DIR` overrides `bench-results/` (used by the tests).
+  - **Local only:** requests must come from a `localhost` / `127.0.0.1` / `[::1]` Host. An `Origin`, if sent, must be one of those, so websites can't read or `DELETE` records and DNS rebinding is refused (403). CORS echoes the local origin, never `*`. Bodies are capped at 16 MB (413). `method` also records the CPU, RAM, GPU and power sources. The dashboard detail shows all of them, with a ⚠ for name-match and older records.
 - `bench/run.mjs` is the Playwright runner. It adds CDP `Performance.getMetrics` deltas to each in-app report, covering **the job only**: it exposes `__nleBenchGate`, which `jobRunner` awaits right before and after the job. `cdp.window` is `job`, and `cdp.wholeRunTaskMs` keeps the old whole-evaluate number.
 
 ## Effects (text, stickers, transitions, filters, animations)
 - **Modules:** `src/media/effects/` holds `text.js` (fonts, presets, layout/draw), `stickers.js` (Path2D/emoji library), `filters.js` (presets → `ctx.filter` + overlays for temperature, tint, vignette and grain), `animations.js` (in/out/loop/reveal → per-frame `AnimState`) and `transitions.js` (draw math).
 - **Shared rendering:** `compositor.js` `layerItemsAt()` resolves each track at time t into clips or a transition (A + B + eased progress). `frameRequests()` lists the media frames needed, including transition partners past a clip's edge. `drawFrame()` renders them.
   - The preview (`playback.js`), the export (`jobs.js`) and the gallery thumbnails (`components/fxThumbs.js`) all use this same path. Keep it that way, so previews match exports.
-- **Video effects** (`effects/fx/videoEffects.js`, 27 effects) are a per-clip stack (`clip.effects`).
+- **Video effects** (`effects/fx/videoEffects.js`, 28 effects) are a per-clip stack (`clip.effects`).
   - Each effect declares typed `params`, which the Inspector turns into controls automatically.
   - Each also has a Canvas2D `process(src → dst)` layer processor or a `motion()` transform modifier. Motion Trail is handled in `drawClip`.
   - Clips with layer effects render alone into a pooled full-frame layer (`fx/util.js` `acquire`/`release`, which must be released in the same frame), run through the chain, then composite.
@@ -95,6 +104,20 @@ A browser-based non-linear video editor (NLE) whose purpose is **benchmarking Me
 - **Clipboard:** `copySelection` / `pasteClipboard` / `duplicateSelection` / `pasteAttributes` live in `store.js` and are wired to ⌘C/X/V/D and ⌥⌘V in `shortcuts.js`.
 - **Box select:** dragging on empty timeline space draws a marquee (`onLanePointerDown` in `Timeline.jsx`). A click without a drag seeks.
 
+## Editor rules (from the audit fixes)
+- **Locks:** a clip on a locked track can't be changed in any way (move, trim, split, delete, cut, Inspector, paste attributes, effects, transitions). `enforceLocks` in `store.js` runs after every commit and gesture, restores locked clips exactly, and moves clips that land on a locked track off it. The UI also refuses with a toast, and the Inspector shows a read-only fieldset. Known gap: a transition shared between a locked clip and an unlocked neighbour is dropped when the neighbour moves away.
+- **Undo never drops media:** history entries carry an asset delta. Undo/redo keep the live asset list, except that undoing an explicit asset removal restores the asset. Gestures read assets from live state, so an import that finishes mid-drag survives. No-op commits add no undo entry.
+- **Editor jobs are queued (FIFO):** a second export or convert waits (`status: 'queued'`, cancelable, "N queued" in the top bar), so benchmark sessions don't overlap. The test hooks `exportRange` / `exportToHandle` call `runAndReport` directly and bypass the queue.
+- **Outputs:** at most `MAX_OUTPUTS` (10) export Blob URLs are kept. Older ones, and those of trimmed reports, are revoked, and the Bench panel says so.
+- **Split keeps animation phase:** the right half gets `phase` / `span` (`clipLocal` / `clipSpan` in `animations.js`), so loops, Ken Burns, text fx and reveals continue across the cut.
+- **Timecode:** SMPTE drop-frame (`HH:MM:SS;FF`) for 29.97/59.94, and exact-rate for 23.976. Clip edges snap to the frame grid unless they snap to another clip.
+- **Rendering paths:**
+  - `drawFrame` clips to the project rect, so letterbox bars stay black in preview and export.
+  - A dissolve uses the cheap in-place path only when B is opaque and covers A. Otherwise A·(1−p) and B·p are summed in layers, and one-sided transitions fade.
+  - Filter overlays multiply the inherited alpha. Faded or non-video filtered clips render isolated, then composite once at clip alpha. Both cost extra full-frame layers, so composite times differ from older runs for those edits.
+- **Motion Trail:** each ghost shows the clip's own PAST frame. `frameRequests` returns `{ key: '<clip>#g<i>' }` requests, export and preview use `key ?? clip.id` for their reader and frame maps, and each ghost costs one extra decoder. Gallery thumbnails still draw the current frame.
+- **Audio mix:** 3/4/5/6/8-channel down-mix keeps the centre channel. The mix buffer grows by doubling. The resampler is still linear (no anti-aliasing).
+
 ## Timeline placement rule
 Clips never overwrite each other. `placeWithoutOverlap()` in `store.js` handles adding media, adding a title, and drag-moves (applied on release).
 - A clip that would collide goes to the nearest free track of the same kind (video searches upward, audio downward). If none is free, a new track is created.
@@ -108,7 +131,8 @@ Clips never overwrite each other. `placeWithoutOverlap()` in `store.js` handles 
 
 ## Metric definitions
 The `JobReport` shape built in `src/bench/metrics.js` (`deriveMetrics`) and `jobRunner.js` is the source of truth, and `jobs.js` fills the stage timers.
-- **Encode time:** time spent awaiting `source.add()` (encoder queue and backpressure) plus finalize flush.
+- **Encode wait (`derived.encodeWaitMs`, was `encodeMs`):** time spent awaiting `source.add()` (encoder queue back-pressure) plus the finalize flush. It is not encoder busy time: a decode-bound job reads ~0 while the encoder works. Use `encoder.encoderSpan` (first video submit → last video packet) and the latency numbers for encoder work.
+- **`derived.pipelineFps` (was `encodeFps`):** output frames ÷ total job time, i.e. end-to-end throughput. Conversion frame counts are estimated from duration × fps. `hwPreference` is the *requested* hardware mode; the browser doesn't say which path ran.
 - **Encoder latency:** submit → `onEncodedPacket`, per frame.
 - **Decode time:** time awaiting frames from sinks.
 - **Mediabunny `Conversion` jobs:** only total, init and time-to-first-progress can be measured, because decode and encode are pipelined internally. Use the "manual pipeline" engine for a per-stage split.
@@ -130,12 +154,15 @@ The `JobReport` shape built in `src/bench/metrics.js` (`deriveMetrics`) and `job
   - Windows paths are untested.
   - **Native vs WASM AAC sizes differ:** on macOS Chrome the native AAC encoder wrote ~47 kb/s for the synthetic fixture tone, where the WASM encoder wrote ~194 kb/s for the same requested quality (2026-11-18, `bench/regress.mjs` B1). So compare encode speed between the two with output size in mind.
 - **Output verification:** `verifyOutput` (in `jobRunner.js`) re-probes each output and decodes it (`decodeCheck` in `probe.js`).
-  - **Checks:** the tracks the job meant to write are present (`result.tracks`); codecs; container (output-format MIME vs re-probed MIME); size; frame rate (±2 %); audio sample rate (except codec-imposed rates, e.g. Opus at 48 kHz) and channels; duration within max(0.15 s, 2 frames).
+  - **Checks:** the tracks the job meant to write are present (`result.tracks`); codecs; container (output-format MIME vs re-probed MIME); size; frame rate (±2 %); audio sample rate (except codec-imposed rates, e.g. Opus at 48 kHz) and channels.
+  - **Durations, per track** (`result.trackDurations`): video within ±1 frame; audio within the codec's priming plus padding (`AUDIO_SLACK`: AAC 2112+2048 samples, measured over a full length sweep; MP3, Opus …; PCM ±1 sample). Mediabunny keeps encoder priming in the timeline, so AAC tracks run ~45–90 ms long.
+  - **No stream-copy exemption.** Copy only happens when codec, size and fps (audio: codec, rate, channels) already match the request, so size, fps and frame count are always checked against the request.
   - **Decode depth:** by default the first 3 frames and samples **plus the last video frame and the final ~0.25 s of audio**, which catches truncated files. Full decode (every frame and sample, with the frame count and audio length compared) is on for `--matrix`, and opt-in with `--full-verify` or `localStorage['bench.fullVerify'] = '1'`. `verify.depth` records which one ran.
   - `status: 'done'` only means the job ran; `verify.ok` is the content check.
-  - `bench/run.mjs` builds medians only from runs with `verify.ok` (`bench/summary.mjs`), and exits 1 if any run errored or failed verification.
+  - `bench/run.mjs` (`bench/summary.mjs`) reports the **median run**, a real run picked by conversion time rather than a column-wise median. It's chosen only from runs that finished, verified, ran in a visible tab and didn't overlap another job. The runner exits 1 if any run fails one of those.
 - **Audio progress in exports** is an integer sample cursor (`audioPos` / `audioTotal` in `jobs.js`). Never compare a float audio time against the duration: a sub-sample remainder used to hang the export.
 - **Conversion stream copy** happens only when codec, sample rate **and** channel count already match the request (`audioSame` in `jobs.js`).
+- **Failure cleanup:** `exportProject` and `runConversion` run inside `try` / `catch` / `finally`. On any error or cancel they call `output.cancel()` and `handle.fail()`, which aborts a streamed file's writable. Readers, decoders, the asset pool and the input are always disposed. Audio samples are closed even if `add()` throws.
 
 ## Gotchas
 - COOP `same-origin` and COEP `require-corp` are required. The extension WASM uses shared-memory threads, so without them it falls back to a slower path and skews the benchmarks. Don't load cross-origin resources (fonts, CDNs) without CORP/CORS.

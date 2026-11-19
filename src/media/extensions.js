@@ -61,23 +61,33 @@ export function registerAllExtensions() {
  */
 export const AAC_MODES = ['auto', 'native', 'wasm']
 let aacRegistered = false
-let nativeAacP = null
+const nativeAac = new Map() // "rate/channels" → Promise<boolean>
 
-/** Whether this browser can encode AAC through WebCodecs (48 kHz stereo 128 kb/s). Cached per context. */
-export function nativeAacSupported() {
-  nativeAacP ??=
-    typeof AudioEncoder === 'undefined'
-      ? Promise.resolve(false)
-      : AudioEncoder.isConfigSupported({ codec: 'mp4a.40.2', sampleRate: 48000, numberOfChannels: 2, bitrate: 128000 })
-          .then((r) => r.supported === true)
-          .catch(() => false)
-  return nativeAacP
+/**
+ * Whether this browser can encode AAC through WebCodecs for this sample rate / channel count (128 kb/s). Cached per
+ * context and config: 48 kHz stereo being supported says nothing about, say, 22.05 kHz mono.
+ */
+export function nativeAacSupported({ sampleRate = 48000, numberOfChannels = 2 } = {}) {
+  const key = `${sampleRate}/${numberOfChannels}`
+  if (!nativeAac.has(key))
+    nativeAac.set(
+      key,
+      typeof AudioEncoder === 'undefined'
+        ? Promise.resolve(false)
+        : AudioEncoder.isConfigSupported({ codec: 'mp4a.40.2', sampleRate, numberOfChannels, bitrate: 128000 })
+            .then((r) => r.supported === true)
+            .catch(() => false),
+    )
+  return nativeAac.get(key)
 }
 
-/** Registers (or not) the WASM AAC encoder for `mode` and returns which implementation AAC jobs here will use. */
-export async function prepareAacEncoder(mode = 'auto') {
+/**
+ * Registers (or not) the WASM AAC encoder for `mode` and returns which implementation AAC jobs here will use.
+ * `config` is the job's audio config, so 'auto' falls back to WASM when THAT config has no native encoder.
+ */
+export async function prepareAacEncoder(mode = 'auto', config = {}) {
   if (!AAC_MODES.includes(mode)) mode = 'auto'
-  const native = await nativeAacSupported()
+  const native = await nativeAacSupported(config)
   if (!aacRegistered && (mode === 'wasm' || (mode === 'auto' && !native))) {
     try {
       registerAacEncoder()

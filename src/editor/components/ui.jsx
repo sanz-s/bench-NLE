@@ -178,6 +178,7 @@ export function NumberField(props) {
         className="num-label"
         title="Drag to change · Shift ×10 · Alt ×0.1 · Double-click to reset"
         onPointerDown={(e) => {
+          if (e.currentTarget.closest('fieldset:disabled')) return // read-only (e.g. clip on a locked track)
           e.target.setPointerCapture(e.pointerId)
           drag.current = { x: e.clientX, v: props.value * scale, moved: false }
         }}
@@ -194,7 +195,7 @@ export function NumberField(props) {
           if (drag.current?.moved) emit(props.value * scale, true)
           drag.current = null
         }}
-        onDoubleClick={() => props.defaultValue !== undefined && props.onChange(props.defaultValue, true)}
+        onDoubleClick={(e) => !e.currentTarget.closest('fieldset:disabled') && props.defaultValue !== undefined && props.onChange(props.defaultValue, true)}
       >
         {props.label}
       </span>

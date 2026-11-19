@@ -2,7 +2,7 @@ import { ProbeError, makeThumbnail, probeFile } from '../media/probe'
 import { timelineDuration } from '../media/compositor'
 import { containerDef } from '../media/formats'
 import { executeJob, runAndReport } from '../bench/jobRunner'
-import { addAsset, addReport, getState, setState, toast } from './store'
+import { addAsset, addReport, getState, patchAsset, setState, toast } from './store'
 import { uid } from './model'
 
 // ------------------------------------------------------------------ import
@@ -20,10 +20,7 @@ export async function importFiles(files) {
         added.push(asset)
         for (const w of info.warnings) toast('info', `${file.name}: ${w}`)
         void makeThumbnail(file, info).then((thumb) => {
-          if (!thumb) return
-          setState((s) => ({
-            project: { ...s.project, assets: s.project.assets.map((a) => (a.id === asset.id ? { ...a, thumb } : a)) },
-          }))
+          if (thumb) patchAsset(asset.id, { thumb })
         })
       } catch (err) {
         const msg = err instanceof ProbeError ? err.message : `Couldn't import "${file.name}": ${err instanceof Error ? err.message : String(err)}`
@@ -50,7 +47,8 @@ export async function generateTestClip(spec = {}) {
   }
   setState((s) => ({ importing: s.importing + 1 }))
   try {
-    const r = await executeJob({ kind: 'fixture', spec: full }, { runIn: 'worker' })
+    // fixture encoding is a heavy job too: it waits for (and blocks) the editor job queue like an export
+    const r = await inQueue(() => executeJob({ kind: 'fixture', spec: full }, { runIn: 'worker' }))
     const file = new File([r.buffer], r.fileName, { type: r.mimeType })
     const [asset] = await importFiles([file])
     return asset ?? null
@@ -88,15 +86,50 @@ function setTitleProgress(p) {
   document.title = p === null ? base : `${Math.round(p * 100)}% · Exporting – ${base}`
 }
 
+/**
+ * Editor jobs run one at a time: two exports sharing the CPU/GPU would make both benchmark records wrong.
+ * A job started while another runs waits in the queue (status 'queued', shown in the top bar) and can be
+ * canceled before it starts.
+ */
+let queueTail = Promise.resolve()
+
+/** Run `fn` when every earlier editor job has finished; later jobs wait for it. */
+async function inQueue(fn) {
+  const prev = queueTail
+  let finished
+  queueTail = new Promise((r) => (finished = r))
+  try {
+    await prev
+    return await fn()
+  } finally {
+    finished()
+  }
+}
+
 async function runTracked(job, opts, label) {
   const id = uid('job')
   const ctrl = new AbortController()
-  setState((s) => ({ jobs: [...s.jobs, { id, label, progress: 0, runIn: opts.runIn, cancel: () => ctrl.abort() }] }))
+  const prev = queueTail
+  let finished
+  queueTail = new Promise((r) => (finished = r))
+  const waiting = getState().jobs.length > 0
+  const cancel = () => {
+    ctrl.abort()
+    // a queued job disappears at once; a running one leaves when its runner returns
+    setState((s) => ({ jobs: s.jobs.filter((j) => !(j.id === id && j.status === 'queued')) }))
+  }
+  setState((s) => ({ jobs: [...s.jobs, { id, label, progress: 0, runIn: opts.runIn, status: waiting ? 'queued' : 'running', cancel }] }))
   const update = (progress) => {
     setState((s) => ({ jobs: s.jobs.map((j) => (j.id === id ? { ...j, progress } : j)) }))
     setTitleProgress(progress)
   }
   try {
+    await prev
+    if (ctrl.signal.aborted) {
+      toast('info', `${label}: canceled before it started`)
+      return null
+    }
+    setState((s) => ({ jobs: s.jobs.map((j) => (j.id === id ? { ...j, status: 'running' } : j)) }))
     const res = await runAndReport(job, {
       runIn: opts.runIn,
       label: opts.label,
@@ -128,6 +161,7 @@ async function runTracked(job, opts, label) {
   } finally {
     setState((s) => ({ jobs: s.jobs.filter((j) => j.id !== id) }))
     setTitleProgress(getState().jobs.length ? 0 : null)
+    finished()
   }
 }
 

@@ -114,6 +114,9 @@ export async function probeFile(file) {
       throw new ProbeError(warnings.join(' ') || 'No decodable tracks.')
     }
     const duration = await input.computeDuration()
+    // per-track end times: the verifier checks video to ±1 frame and audio against its codec's frame size
+    if (video) video.duration = await primaryVideo.computeDuration().catch(() => null)
+    if (audio) audio.duration = await primaryAudio.computeDuration().catch(() => null)
     return {
       kind: video && video.canDecode ? 'video' : 'audio',
       container: formatName,

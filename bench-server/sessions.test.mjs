@@ -67,6 +67,22 @@ test('overlapping sessions are flagged on both sides and each keeps its own proc
   assert.ok(sb.browserCpuPct.avg < 20, `idle tree avg ${sb.browserCpuPct.avg}`)
 })
 
+test('a finished job keeps its overlap when the other job runs on (Copilot R2)', async () => {
+  const a = await post('/sessions', { label: 'short', rootPid: busy.pid })
+  const b = await post('/sessions', { label: 'long', rootPid: idle.pid })
+  await sleep(600)
+  const sa = await post(`/sessions/${a.id}/stop`)
+  const first = sa.overlap.sessions[0].overlapMs
+  assert.ok(first <= sa.durationMs, `overlap ${first} ms > job ${sa.durationMs} ms`)
+  await sleep(1200) // b keeps running
+  await post(`/sessions/${b.id}/stop`)
+  // a's summary must not change after b stops (old code: it grew to b's end)
+  const again = await post(`/sessions/${a.id}/stop`)
+  assert.equal(again.overlap.sessions[0].overlapMs, first)
+  const sb = await post(`/sessions/${b.id}/stop`)
+  assert.ok(Math.abs(sb.overlap.sessions[0].overlapMs - first) < 5, `b sees ${sb.overlap.sessions[0].overlapMs} ms, a sees ${first} ms`)
+})
+
 test('the job-end mark stops sampling; the pre-job sample is not part of the session', async () => {
   const t0 = Date.now()
   const { id } = await post('/sessions', { label: 'window', rootPid: busy.pid })
@@ -97,4 +113,33 @@ test('a session whose page goes quiet expires and leaves the Live view', async (
   const fresh = await post('/sessions', { label: 'after orphan', rootPid: busy.pid })
   const sf = await post(`/sessions/${fresh.id}/stop`)
   assert.equal(sf.overlap, null)
+})
+
+test('only local origins and hosts may use the API; bodies are capped (audit §3.12)', async () => {
+  const http = await import('node:http')
+  const raw = (opts, body) =>
+    new Promise((resolve, reject) => {
+      const req = http.request({ host: '127.0.0.1', port: PORT, ...opts }, (res) => {
+        res.resume()
+        res.on('end', () => resolve({ status: res.statusCode, acao: res.headers['access-control-allow-origin'] }))
+      })
+      req.on('error', (e) => (e.code === 'ECONNRESET' || e.code === 'EPIPE' ? resolve({ status: 'reset' }) : reject(e)))
+      if (body) req.write(body)
+      req.end()
+    })
+  // a website wiping the records: refused, and no CORS grant
+  const evil = await raw({ method: 'DELETE', path: '/records', headers: { origin: 'https://evil.example' } })
+  assert.equal(evil.status, 403)
+  assert.equal(evil.acao, undefined)
+  // DNS rebinding: right IP, foreign Host header
+  assert.equal((await raw({ method: 'GET', path: '/records', headers: { host: 'evil.example:5299' } })).status, 403)
+  // the dashboard / Vite pages are fine, and get their own origin back (never '*')
+  const ok = await raw({ method: 'GET', path: '/health', headers: { origin: 'http://localhost:5173' } })
+  assert.equal(ok.status, 200)
+  assert.equal(ok.acao, 'http://localhost:5173')
+  // no Origin (Vite bridge, Node, curl)
+  assert.equal((await raw({ method: 'GET', path: '/health' })).status, 200)
+  // oversized body
+  const big = await raw({ method: 'POST', path: '/sessions', headers: { 'content-type': 'application/json', 'content-length': String(17 * 1024 * 1024) } })
+  assert.ok(big.status === 413 || big.status === 'reset', `got ${big.status}`)
 })

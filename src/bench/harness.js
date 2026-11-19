@@ -17,6 +17,16 @@ import { flattenReport, toCSV } from './metrics'
 import { installMainThreadObservers, startMainThreadWindow } from './mainThread'
 import { runAndReport, verifyOutput } from './jobRunner'
 import { probeFile } from '../media/probe'
+import * as editorStore from '../editor/store'
+import * as editorActions from '../editor/actions'
+import * as editorModel from '../editor/model'
+import * as compositor from '../media/compositor'
+import * as audioMix from '../media/audioMix'
+import * as videoEffects from '../media/effects/fx/videoEffects'
+import * as fxUtil from '../media/effects/fx/util'
+import * as animations from '../media/effects/animations'
+import * as filters from '../media/effects/filters'
+import { preview } from '../editor/playback'
 
 /** Scenario settings. The AAC encoder under test comes from `bench/run.mjs --aac` (localStorage) unless the patch sets it. */
 function settingsFor(base, patch) {
@@ -43,6 +53,12 @@ function releaseOutput(reportId) {
 const api = {
   version: 1,
   ready: true,
+
+  /**
+   * Test hook (bench/editor-regress.mjs): the editor/compositor modules themselves, so regression tests can
+   * drive the real store actions and render frames through the shared drawFrame path without the UI.
+   */
+  editor: { store: editorStore, actions: editorActions, model: editorModel, compositor, audioMix, videoEffects, fxUtil, animations, filters, preview },
 
   async capabilities(q) {
     const p = getState().project
@@ -432,6 +448,14 @@ const api = {
     const settings = settingsFor(defaultEncodeSettings(project), patch)
     const { report, file } = await runAndReport({ kind: 'export', project, settings, range, target: { kind: 'buffer' } }, { runIn: opts.runIn ?? 'worker', label: opts.label ?? 'range export' })
     if (opts.keepFile) this.lastFile = file
+    return report
+  },
+
+  /** Test hook: export a range to a FileSystemFileHandle-like object (stream target). Main thread only (a fake handle can't be posted to a worker). */
+  async exportToHandle(range, patch = {}, handle, opts = {}) {
+    const project = getState().project
+    const settings = settingsFor(defaultEncodeSettings(project), patch)
+    const { report } = await runAndReport({ kind: 'export', project, settings, range, target: { kind: 'stream', handle } }, { runIn: 'main', label: opts.label ?? 'stream export' })
     return report
   },
 

@@ -106,14 +106,28 @@ function applyEdge(kind, p, W, H, s) {
   }
 }
 
+/**
+ * Time inside the clip's own animation clock. A split half carries `phase` (seconds into the original clip at
+ * its start), so loops, Ken Burns, text fx and reveals continue across the cut instead of restarting.
+ */
+export function clipLocal(c, t) {
+  return t - c.start + (c.phase ?? 0)
+}
+
+/** Length of the clip's animation clock: the original clip's length for split halves (`span`), else its duration. */
+export function clipSpan(c) {
+  return c.span ?? (c.phase ?? 0) + c.duration
+}
+
 /** Animation modifiers for clip `c` at timeline time `t`. */
 export function animState(c, t, W, H) {
   const a = c.anim
   if (!a || !hasAnim(a)) return IDENTITY
   const s = { ...IDENTITY }
-  const local = t - c.start
+  const edge = t - c.start // in/out animations are tied to this clip's own edges
+  const local = clipLocal(c, t)
   const remaining = c.start + c.duration - t
-  if (a.in !== 'none' && a.inDur > 0) applyEdge(a.in, local / a.inDur, W, H, s)
+  if (a.in !== 'none' && a.inDur > 0) applyEdge(a.in, edge / a.inDur, W, H, s)
   if (a.out !== 'none' && a.outDur > 0) applyEdge(a.out, remaining / a.outDur, W, H, s)
   if (a.loop !== 'none') {
     const w = 2 * Math.PI * (a.loopSpeed || 1)

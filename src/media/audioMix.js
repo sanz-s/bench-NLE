@@ -80,36 +80,83 @@ export class ClipAudioReader {
     this.bufStart = clip.in
   }
 
+  /**
+   * Map decoded source planes to the output layout. Same-count layouts pass through; otherwise channels are
+   * down-mixed with the Web Audio / ITU coefficients, assuming the standard orders: 3 = L R C, 4 = L R SL SR
+   * (quad), 5 = L R C SL SR, 6 = L R C LFE SL SR (5.1), 8 = L R C LFE BL BR SL SR (7.1). LFE is dropped.
+   */
   mapChannels(planes) {
     const n = planes[0].length
-    const out = Array.from({ length: this.outCh }, () => new Float32Array(n))
     const c = planes.length
-    if (this.outCh === 1) {
-      for (let i = 0; i < n; i++) {
-        let s = 0
-        for (let k = 0; k < c; k++) s += planes[k][i]
-        out[0][i] = s / c
+    const outCh = this.outCh
+    const out = Array.from({ length: outCh }, () => new Float32Array(n))
+    if (c === outCh) {
+      for (let ch = 0; ch < outCh; ch++) out[ch].set(planes[ch])
+      return out
+    }
+    if (c === 1) {
+      // mono → front left/right (centre-less layouts) like Web Audio's up-mix
+      if (outCh === 1) out[0].set(planes[0])
+      else {
+        out[0].set(planes[0])
+        out[1].set(planes[0])
       }
       return out
     }
-    // outCh >= 2
-    if (c === 1) {
-      for (let ch = 0; ch < this.outCh; ch++) out[ch].set(planes[0])
-    } else if (c === 6) {
-      // L R C LFE SL SR → stereo
-      const [L, R, C, , SL, SR] = planes
-      const k = Math.SQRT1_2
-      for (let i = 0; i < n; i++) {
-        out[0][i] = L[i] + k * C[i] + k * SL[i]
-        out[1][i] = R[i] + k * C[i] + k * SR[i]
-      }
+    const k = Math.SQRT1_2
+    // fold everything to L/R first
+    const L = new Float32Array(n)
+    const R = new Float32Array(n)
+    const add = (dst, src, g) => {
+      for (let i = 0; i < n; i++) dst[i] += src[i] * g
+    }
+    if (c === 2) {
+      L.set(planes[0])
+      R.set(planes[1])
+    } else if (c === 3) {
+      add(L, planes[0], 1)
+      add(R, planes[1], 1)
+      add(L, planes[2], k)
+      add(R, planes[2], k)
+    } else if (c === 4) {
+      add(L, planes[0], 0.5)
+      add(R, planes[1], 0.5)
+      add(L, planes[2], 0.5)
+      add(R, planes[3], 0.5)
+    } else if (c === 5 || c === 6) {
+      const [l, r, C] = planes
+      const SL = planes[c === 6 ? 4 : 3]
+      const SR = planes[c === 6 ? 5 : 4]
+      add(L, l, 1)
+      add(R, r, 1)
+      add(L, C, k)
+      add(R, C, k)
+      add(L, SL, k)
+      add(R, SR, k)
+    } else if (c === 8) {
+      const [l, r, C, , BL, BR, SL, SR] = planes
+      add(L, l, 1)
+      add(R, r, 1)
+      add(L, C, k)
+      add(R, C, k)
+      add(L, SL, k)
+      add(R, SR, k)
+      add(L, BL, k)
+      add(R, BR, k)
     } else {
-      out[0].set(planes[0])
-      out[1].set(planes[1])
+      // unknown layout: average even channels to L, odd to R
+      for (let ch = 0; ch < c; ch++) add(ch % 2 ? R : L, planes[ch], 2 / c)
+    }
+    if (outCh === 1) {
+      for (let i = 0; i < n; i++) out[0][i] = (L[i] + R[i]) / 2
+    } else {
+      out[0].set(L)
+      out[1].set(R)
     }
     return out
   }
 
+  /** Append decoded planes. The buffer grows by doubling (amortized O(1) per sample, not a full copy per packet). */
   append(planes, sampleTime) {
     const expectedTime = this.bufStart + this.bufLen / this.srcRate
     const gapFrames = Math.round((sampleTime - expectedTime) * this.srcRate)
@@ -120,10 +167,15 @@ export class ClipAudioReader {
     const addLen = pad + data[0].length
     const newLen = this.bufLen + addLen
     for (let ch = 0; ch < this.outCh; ch++) {
-      const nb = new Float32Array(newLen)
-      nb.set(this.buf[ch].subarray(0, this.bufLen))
-      nb.set(data[ch], this.bufLen + pad)
-      this.buf[ch] = nb
+      let b = this.buf[ch]
+      if (b.length < newLen) {
+        const nb = new Float32Array(Math.max(newLen, b.length * 2, 4096))
+        nb.set(b.subarray(0, this.bufLen))
+        b = nb
+        this.buf[ch] = b
+      }
+      if (pad) b.fill(0, this.bufLen, this.bufLen + pad)
+      b.set(data[ch], this.bufLen + pad)
     }
     this.bufLen = newLen
   }
@@ -160,7 +212,7 @@ export class ClipAudioReader {
     if (!this.srcRate) return
     const drop = Math.floor((s - this.bufStart) * this.srcRate) - 4
     if (drop > this.srcRate) {
-      for (let ch = 0; ch < this.outCh; ch++) this.buf[ch] = this.buf[ch].slice(drop, this.bufLen)
+      for (let ch = 0; ch < this.outCh; ch++) this.buf[ch].copyWithin(0, drop, this.bufLen)
       this.bufLen -= drop
       this.bufStart += drop / this.srcRate
     }

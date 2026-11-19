@@ -72,6 +72,21 @@ function inputSummary(job) {
 
 /** Sample rates a codec imposes regardless of the request (the encoder resamples): Opus always runs at 48 kHz. */
 const FORCED_RATE = { opus: 48000 }
+/**
+ * Allowed audio-track length error, in samples: the encoder's start delay (priming) plus padding to a whole codec
+ * frame. Mediabunny keeps priming in the track's timeline, so an encoded track is up to this much longer.
+ *   AAC: 2112 + 2048. Chrome's native (Apple) encoder writes ceil((n + 2112) / 1024) + 1 frames, i.e. up to
+ *        2112 priming + 2047 padding samples (measured over a full 1024-sample sweep, 44.1 and 48 kHz; FFmpeg: less)
+ *   MP3: 1105 (LAME 576 + decoder 529) + 1152
+ *   Opus: 312 + 960 (at 48 kHz) · Vorbis / FLAC / AC-3 / E-AC-3 / DTS: two frames · TrueHD: tiny · PCM: 1 sample
+ */
+const AUDIO_SLACK = { aac: 2112 + 2048, mp3: 1105 + 1152, opus: 312 + 960, vorbis: 2 * 2048, flac: 2 * 4608, ac3: 2 * 1536, eac3: 2 * 1536, dts: 2 * 512, truehd: 2 * 40 }
+/** Allowed audio duration error in seconds (codec slack + 5 ms; PCM: 1 sample + 1 ms). */
+export function audioDurationTolerance(codec, rate) {
+  const n = AUDIO_SLACK[codec]
+  if (!n) return 1 / (rate || 48000) + 0.001
+  return n / (codec === 'opus' ? 48000 : rate || 48000) + 0.005
+}
 /** "video/x-matroska; codecs=…" → "matroska" (subtype without x- prefix), so output-format and probed MIME compare. */
 const mimeKind = (m) => ((m ?? '').split(';')[0].split('/')[1] ?? '').toLowerCase().replace(/^x-/, '')
 
@@ -80,8 +95,8 @@ const mimeKind = (m) => ((m ?? '').split(';')[0].split('/')[1] ?? '').toLowerCas
  *  - it really decodes (head + tail by default; every frame/sample with opts.full: see decodeCheck)
  *  - the tracks the job meant to write are present (expect.tracks from the job result)
  *  - codecs, container (expect.mimeType vs the re-probed MIME), size, frame rate, audio sample rate and channels
- *  - duration within max(0.15 s, 2 frames) (encoder priming adds tens of ms on AAC / MP3 / Opus)
- *  - full mode: decoded frame count and audio length against the expected duration
+ *  - per-track duration: video ±1 frame, audio ± the codec's priming + one frame of padding (PCM ±1 sample)
+ *  - full mode: decoded frame count (±1) and decoded audio length against the expected duration
  */
 export async function verifyOutput(file, job, expectedDuration, expect = {}) {
   try {
@@ -93,7 +108,8 @@ export async function verifyOutput(file, job, expectedDuration, expect = {}) {
     const audioOnlyContainer = /^(mp3|wav|aac|flac|ogg)$/.test(s.container)
     const expectVideo = expect.tracks ? !!expect.tracks.video : !!s.videoCodec && !audioOnlyContainer
     const expectAudio = expect.tracks ? !!expect.tracks.audio : job.kind === 'convert' ? !!s.audioCodec && !!job.asset?.info?.audio : null
-    const copiedVideo = job.kind === 'convert' && job.engine === 'conversion' && job.allowCopy && job.asset?.info?.video?.codec === s.videoCodec
+    // No exemption for stream-copied video: copy only happens when codec, size AND frame rate already match the
+    // request (videoSame in jobs.js), so the requested values are always what the file must have.
 
     if (expectVideo && !info.video) problems.push('video track is missing')
     if (expectAudio && !info.audio) problems.push('audio track is missing')
@@ -101,12 +117,9 @@ export async function verifyOutput(file, job, expectedDuration, expect = {}) {
     if (s.audioCodec && info.audio && info.audio.codec !== s.audioCodec) problems.push(`audio codec is ${info.audio.codec}, expected ${s.audioCodec}`)
     if (expect.mimeType && info.mimeType && mimeKind(expect.mimeType) !== mimeKind(info.mimeType)) problems.push(`container is ${info.mimeType}, expected ${expect.mimeType}`)
 
-    if (expectVideo && info.video && (info.video.width !== s.width || info.video.height !== s.height)) {
-      // Conversion with stream copy keeps the source size; only flag when we re-encoded.
-      if (!copiedVideo) problems.push(`size ${info.video.width}×${info.video.height}, expected ${s.width}×${s.height}`)
-    }
+    if (expectVideo && info.video && (info.video.width !== s.width || info.video.height !== s.height)) problems.push(`size ${info.video.width}×${info.video.height}, expected ${s.width}×${s.height}`)
     // probe fps comes from packet statistics: allow 2 %
-    if (expectVideo && info.video?.fps > 0 && s.fps > 0 && !copiedVideo && Math.abs(info.video.fps - s.fps) / s.fps > 0.02)
+    if (expectVideo && info.video?.fps > 0 && s.fps > 0 && Math.abs(info.video.fps - s.fps) / s.fps > 0.02)
       problems.push(`frame rate ${info.video.fps.toFixed(3)}, expected ${s.fps}`)
 
     if (info.audio && s.audioCodec) {
@@ -115,13 +128,24 @@ export async function verifyOutput(file, job, expectedDuration, expect = {}) {
       if (s.audioChannels && info.audio.channels !== s.audioChannels) problems.push(`audio has ${info.audio.channels} channel(s), expected ${s.audioChannels}`)
     }
 
-    const tol = Math.max(0.15, 2 / s.fps)
-    if (Math.abs(info.duration - expectedDuration) > tol) problems.push(`duration ${info.duration.toFixed(3)}s vs expected ${expectedDuration.toFixed(3)}s`)
+    // durations per track: video to ±1 frame (output is a whole number of frames), audio to ±2 codec frames
+    const vTol = s.fps > 0 ? 1 / s.fps + 0.002 : 0.05
+    const aRate = info.audio?.sampleRate ?? s.sampleRate
+    const aTol = audioDurationTolerance(info.audio?.codec ?? s.audioCodec, aRate)
+    // expected length per track (expect.trackDurations from the job result); the overall duration otherwise
+    const wantV = expect.trackDurations?.video ?? expectedDuration
+    const wantA = expect.trackDurations?.audio ?? expectedDuration
+    const f3 = (x) => x.toFixed(3)
+    if (expectVideo && info.video?.duration != null && Math.abs(info.video.duration - wantV) > vTol)
+      problems.push(`video lasts ${f3(info.video.duration)} s, expected ${f3(wantV)} s ±1 frame`)
+    if (info.audio?.duration != null && (expectAudio ?? true) && Math.abs(info.audio.duration - wantA) > aTol)
+      problems.push(`audio lasts ${f3(info.audio.duration)} s, expected ${f3(wantA)} s ±${(aTol * 1000).toFixed(0)} ms`)
+    if (info.video?.duration == null && info.audio?.duration == null && Math.abs(info.duration - expectedDuration) > Math.max(vTol, aTol))
+      problems.push(`duration ${f3(info.duration)} s vs expected ${f3(expectedDuration)} s`)
     if (full) {
-      const frameRate = copiedVideo ? job.asset.info.video.fps : s.fps
-      const wantFrames = Math.round(expectedDuration * frameRate)
-      if (dec.videoFrames !== null && Math.abs(dec.videoFrames - wantFrames) > 2) problems.push(`decoded ${dec.videoFrames} video frames, expected ~${wantFrames}`)
-      if (dec.audioSeconds !== null && Math.abs(dec.audioSeconds - expectedDuration) > tol) problems.push(`decoded ${dec.audioSeconds.toFixed(3)} s of audio, expected ~${expectedDuration.toFixed(3)} s`)
+      const wantFrames = Math.round(wantV * s.fps)
+      if (dec.videoFrames !== null && Math.abs(dec.videoFrames - wantFrames) > 1) problems.push(`decoded ${dec.videoFrames} video frames, expected ${wantFrames} ±1`)
+      if (dec.audioSeconds !== null && Math.abs(dec.audioSeconds - wantA) > aTol) problems.push(`decoded ${f3(dec.audioSeconds)} s of audio, expected ${f3(wantA)} s ±${(aTol * 1000).toFixed(0)} ms`)
     }
     return {
       ok: problems.length === 0,
@@ -327,7 +351,7 @@ export async function runAndReport(job, opts) {
   }
   const input = inputSummary(job)
   const fullVerify = opts.fullVerify ?? readPref('bench.fullVerify') === '1'
-  const verify = file && result ? await verifyOutput(file, job, result.mediaDuration, { tracks: result.tracks, mimeType: result.mimeType, full: fullVerify }) : null
+  const verify = file && result ? await verifyOutput(file, job, result.mediaDuration, { tracks: result.tracks, trackDurations: result.trackDurations, mimeType: result.mimeType, full: fullVerify }) : null
   const bytes = result?.outputBytes ?? 0
   const report = {
     id,
@@ -348,7 +372,7 @@ export async function runAndReport(job, opts) {
       bitrateKbps: result && result.mediaDuration > 0 ? (bytes * 8) / result.mediaDuration / 1000 : null,
     },
     timings: result?.timings ?? { total: wallMs },
-    derived: result ? deriveMetrics(result, wallMs) : { conversionMs: wallMs, encodeMs: null, encodeFps: null, realtimeFactor: null, wallMs },
+    derived: result ? deriveMetrics(result, wallMs) : { conversionMs: wallMs, encodeWaitMs: null, pipelineFps: null, realtimeFactor: null, wallMs },
     frames: result?.frames ?? 0,
     encoder: result?.encoder ?? null,
     audioEncoder: result?.audioEncoder ?? null,

@@ -53,7 +53,7 @@ export async function runJob(job, hooks = {}) {
   registerAllExtensions()
   const codec = job.kind === 'fixture' ? job.spec?.audioCodec : job.settings?.audioCodec
   // AAC: native WebCodecs or the WASM extension, decided per job (see prepareAacEncoder)
-  const aac = await prepareAacEncoder(job.settings?.aacEncoder ?? 'auto')
+  const aac = await prepareAacEncoder(job.settings?.aacEncoder ?? 'auto', { sampleRate: job.settings?.sampleRate ?? job.spec?.sampleRate, numberOfChannels: job.settings?.audioChannels ?? job.spec?.audioChannels })
   let result
   switch (job.kind) {
     case 'export':
@@ -86,6 +86,7 @@ async function makeTarget(t) {
       kind: 'buffer',
       bytes: () => target.buffer?.byteLength ?? 0,
       finish: async () => target.buffer ?? undefined,
+      fail: async () => {},
     }
   }
   const file = await t.handle.createWritable()
@@ -122,6 +123,16 @@ async function makeTarget(t) {
         }
       }
       return undefined
+    },
+    /** The job failed: abort the writable so the half-written file is discarded and the handle released. */
+    fail: async (reason) => {
+      if (closed) return
+      closed = true
+      try {
+        await file.abort(reason)
+      } catch {
+        /* already closed or aborted */
+      }
     },
   }
 }
@@ -165,7 +176,7 @@ class EncoderProbe {
 
   onVideoPacket = (packet) => {
     const t = now()
-    this.lastPacket = t
+    this.lastPacket = t // video only: encoderSpan is first video submit → last VIDEO packet
     this.stats.videoPacketsOut++
     if (packet.type === 'key') this.stats.keyFrames++
     const key = Math.round(packet.timestamp * 1e6)
@@ -177,7 +188,6 @@ class EncoderProbe {
   }
 
   onAudioPacket = () => {
-    this.lastPacket = now()
     this.stats.audioPacketsOut++
   }
 
@@ -257,212 +267,232 @@ async function exportProject(project, s, range, jobTarget, baseName, hooks) {
   if (duration <= 0) throw new Error('Nothing to export: the range is empty.')
 
   const handle = await makeTarget(jobTarget)
-  const format = makeOutputFormat(s.container, handle.kind)
-  const output = new Output({ format, target: handle.target })
-  const pool = new AssetPool(project.assets)
+  let output = null
+  let pool = null
+  const videoReaders = new Map() // clip id → VideoReader
+  const audioReaders = new Map() // clip id → ClipAudioReader (created lazily)
+  try {
+    const format = makeOutputFormat(s.container, handle.kind)
+    output = new Output({ format, target: handle.target })
+    pool = new AssetPool(project.assets)
 
-  const wantVideo = !!s.videoCodec && format.getSupportedVideoCodecs().length > 0
-  const audioClips = audibleClips(project).filter((c) => c.start < range.end && clipEnd(c) > range.start)
-  const wantAudio = !!s.audioCodec && audioClips.length > 0
-  if (!wantVideo && !wantAudio) throw new Error('Nothing to encode: no video codec selected and the range has no audible audio.')
+    const wantVideo = !!s.videoCodec && format.getSupportedVideoCodecs().length > 0
+    const audioClips = audibleClips(project).filter((c) => c.start < range.end && clipEnd(c) > range.start)
+    const wantAudio = !!s.audioCodec && audioClips.length > 0
+    if (!wantVideo && !wantAudio) throw new Error('Nothing to encode: no video codec selected and the range has no audible audio.')
 
-  const W = s.width
-  const H = s.height
-  let canvas = null
-  let ctx = null
-  let videoSource = null
-  if (wantVideo) {
-    canvas = new OffscreenCanvas(W, H)
-    ctx = canvas.getContext('2d', { alpha: false })
-    videoSource = new CanvasSource(canvas, {
-      codec: s.videoCodec,
-      bitrate: videoBitrate(s),
-      keyFrameInterval: s.keyFrameInterval,
-      hardwareAcceleration: s.hardwareAcceleration,
-      latencyMode: 'quality',
-      onEncodedPacket: probe.onVideoPacket,
-      onEncoderConfig: probe.onVideoConfig,
-    })
-    output.addVideoTrack(videoSource, { frameRate: s.fps })
-  }
-  let audioSource = null
-  if (wantAudio) {
-    audioSource = new AudioSampleSource({
-      codec: s.audioCodec,
-      bitrate: audioBitrate(s),
-      onEncodedPacket: probe.onAudioPacket,
-      onEncoderConfig: probe.onAudioConfig,
-    })
-    output.addAudioTrack(audioSource)
-  }
-
-  const abortIfNeeded = async () => {
-    if (hooks.signal?.aborted) {
-      await output.cancel().catch(() => {})
-      await pool.dispose().catch(() => {})
-      throw new JobCanceledError()
+    const W = s.width
+    const H = s.height
+    let canvas = null
+    let ctx = null
+    let videoSource = null
+    if (wantVideo) {
+      canvas = new OffscreenCanvas(W, H)
+      ctx = canvas.getContext('2d', { alpha: false })
+      videoSource = new CanvasSource(canvas, {
+        codec: s.videoCodec,
+        bitrate: videoBitrate(s),
+        keyFrameInterval: s.keyFrameInterval,
+        hardwareAcceleration: s.hardwareAcceleration,
+        latencyMode: 'quality',
+        onEncodedPacket: probe.onVideoPacket,
+        onEncoderConfig: probe.onVideoConfig,
+      })
+      output.addVideoTrack(videoSource, { frameRate: s.fps })
     }
-  }
+    let audioSource = null
+    if (wantAudio) {
+      audioSource = new AudioSampleSource({
+        codec: s.audioCodec,
+        bitrate: audioBitrate(s),
+        onEncodedPacket: probe.onAudioPacket,
+        onEncoderConfig: probe.onAudioConfig,
+      })
+      output.addAudioTrack(audioSource)
+    }
 
-  await output.start()
-  timings.setup = now() - t0
+    // cancel: the catch below cancels the output, aborts the target and frees every reader
+    const abortIfNeeded = async () => {
+      if (hooks.signal?.aborted) throw new JobCanceledError()
+    }
 
-  // Audio readers, created lazily.
-  const rate = s.sampleRate
-  const channels = s.audioChannels
-  const audioReaders = new Map()
-  const gainFn = makeGainFn(project)
-  // Audio progress is an INTEGER sample cursor with an exact integer target. (A float time compared against the
-  // duration could leave a sub-sample remainder that rounds to 0 frames forever: the export hung.)
-  const audioTotal = Math.round(duration * rate)
-  let audioPos = 0 // samples written, relative to range.start
-  let audioTime = 0 // = audioPos / rate
-  const AUDIO_CHUNK = Math.round(rate * 0.1)
+    await output.start()
+    timings.setup = now() - t0
 
-  const pushAudioUntil = async (until) => {
-    if (!audioSource) return
-    const target = Math.min(audioTotal, Math.ceil(until * rate - 1e-6))
-    while (audioPos < target) {
-      const frames = Math.min(AUDIO_CHUNK, audioTotal - audioPos)
-      const tm = now()
-      const planes = Array.from({ length: channels }, () => new Float32Array(frames))
-      const absT = range.start + audioTime
-      const absEnd = absT + frames / rate
-      for (const c of audioClips) {
-        if (clipEnd(c) <= absT || c.start >= absEnd) continue
-        let r = audioReaders.get(c.id)
-        if (!r) {
-          const m = await pool.get(c.assetId)
-          if (!m.audio || !(await m.audio.canDecode())) continue
-          r = new ClipAudioReader(m.audio, c, rate, channels, gainFn)
-          audioReaders.set(c.id, r)
+    // Audio readers, created lazily.
+    const rate = s.sampleRate
+    const channels = s.audioChannels
+    const gainFn = makeGainFn(project)
+    // Audio progress is an INTEGER sample cursor with an exact integer target. (A float time compared against the
+    // duration could leave a sub-sample remainder that rounds to 0 frames forever: the export hung.)
+    const audioTotal = Math.round(duration * rate)
+    let audioPos = 0 // samples written, relative to range.start
+    let audioTime = 0 // = audioPos / rate
+    const AUDIO_CHUNK = Math.round(rate * 0.1)
+
+    const pushAudioUntil = async (until) => {
+      if (!audioSource) return
+      const target = Math.min(audioTotal, Math.ceil(until * rate - 1e-6))
+      while (audioPos < target) {
+        const frames = Math.min(AUDIO_CHUNK, audioTotal - audioPos)
+        const tm = now()
+        const planes = Array.from({ length: channels }, () => new Float32Array(frames))
+        const absT = range.start + audioTime
+        const absEnd = absT + frames / rate
+        for (const c of audioClips) {
+          if (clipEnd(c) <= absT || c.start >= absEnd) continue
+          let r = audioReaders.get(c.id)
+          if (!r) {
+            const m = await pool.get(c.assetId)
+            if (!m.audio || !(await m.audio.canDecode())) continue
+            r = new ClipAudioReader(m.audio, c, rate, channels, gainFn)
+            audioReaders.set(c.id, r)
+          }
+          await r.mixInto(planes, absT, frames)
         }
-        await r.mixInto(planes, absT, frames)
-      }
-      for (const [id, r] of audioReaders) {
-        if (clipEnd(r.clip) < absT) {
-          await r.dispose()
-          audioReaders.delete(id)
+        for (const [id, r] of audioReaders) {
+          if (clipEnd(r.clip) < absT) {
+            await r.dispose()
+            audioReaders.delete(id)
+          }
         }
+        const sample = new AudioSample({ data: packPlanar(planes), format: 'f32-planar', numberOfChannels: channels, sampleRate: rate, timestamp: audioTime })
+        timings.audioDecodeMix += now() - tm
+        const te = now()
+        try {
+          await audioSource.add(sample)
+        } finally {
+          sample.close()
+        }
+        timings.audioEncodeWait += now() - te
+        audioPos += frames
+        audioTime = audioPos / rate
       }
-      const sample = new AudioSample({ data: packPlanar(planes), format: 'f32-planar', numberOfChannels: channels, sampleRate: rate, timestamp: audioTime })
-      timings.audioDecodeMix += now() - tm
+    }
+
+    const frameCount = wantVideo ? Math.max(1, Math.round(duration * s.fps)) : 0
+    const projScale = Math.min(W / project.width, H / project.height)
+    const offX = (W - project.width * projScale) / 2
+    const offY = (H - project.height * projScale) / 2
+    let lastProgress = 0
+
+    const report = (processed) => {
+      const t = now()
+      if (t - lastProgress > 100) {
+        lastProgress = t
+        heap.sample()
+        hooks.onProgress?.({ progress: Math.min(1, processed / duration), processedTime: processed })
+      }
+    }
+
+    for (let i = 0; i < frameCount; i++) {
+      await abortIfNeeded()
+      const rel = i / s.fps
+      const abs = range.start + rel
+      const requests = frameRequests(project, abs)
+      const frames = new Map()
+
+      const td = now()
+      await Promise.all(
+        requests.map(async ({ clip: c, src, key }) => {
+          const id = key ?? c.id // Motion Trail ghosts: own reader + frame slot per ghost
+          if (c.kind === 'image') {
+            const bmp = await pool.bitmap(c.assetId)
+            frames.set(c.id, { image: bmp, width: bmp.width, height: bmp.height })
+            return
+          }
+          let r = videoReaders.get(id)
+          if (!r) {
+            const m = await pool.get(c.assetId)
+            if (!m.video) return
+            const [dw, dh] = await Promise.all([m.video.getDisplayWidth(), m.video.getDisplayHeight()])
+            const size = containSize(dw, dh, W, H)
+            r = new VideoReader(m.video, size.w, size.h, 3)
+            videoReaders.set(id, r)
+          }
+          const f = await r.frameAt(src)
+          if (f) frames.set(id, { image: f.canvas, width: f.canvas.width, height: f.canvas.height })
+        }),
+      )
+      timings.decodeWait += now() - td
+
+      const tc = now()
+      if (offX > 0.5 || offY > 0.5) {
+        ctx.fillStyle = '#000'
+        ctx.fillRect(0, 0, W, H)
+      }
+      ctx.save()
+      ctx.translate(offX, offY)
+      drawFrame(ctx, project, abs, frames, projScale)
+      ctx.restore()
+      timings.composite += now() - tc
+
       const te = now()
-      await audioSource.add(sample)
-      timings.audioEncodeWait += now() - te
-      sample.close()
-      audioPos += frames
-      audioTime = audioPos / rate
-    }
-  }
+      probe.markSubmit(rel)
+      await videoSource.add(rel, 1 / s.fps)
+      timings.videoEncodeWait += now() - te
 
-  // Video readers, keyed by clip id.
-  const videoReaders = new Map()
-  const frameCount = wantVideo ? Math.max(1, Math.round(duration * s.fps)) : 0
-  const projScale = Math.min(W / project.width, H / project.height)
-  const offX = (W - project.width * projScale) / 2
-  const offY = (H - project.height * projScale) / 2
-  let lastProgress = 0
-
-  const report = (processed) => {
-    const t = now()
-    if (t - lastProgress > 100) {
-      lastProgress = t
-      heap.sample()
-      hooks.onProgress?.({ progress: Math.min(1, processed / duration), processedTime: processed })
-    }
-  }
-
-  for (let i = 0; i < frameCount; i++) {
-    await abortIfNeeded()
-    const rel = i / s.fps
-    const abs = range.start + rel
-    const requests = frameRequests(project, abs)
-    const frames = new Map()
-
-    const td = now()
-    await Promise.all(
-      requests.map(async ({ clip: c, src }) => {
-        if (c.kind === 'image') {
-          const bmp = await pool.bitmap(c.assetId)
-          frames.set(c.id, { image: bmp, width: bmp.width, height: bmp.height })
-          return
+      // Free readers for clips that are well past their end (transitions can read a little beyond it).
+      for (const [id, r] of videoReaders) {
+        const c = project.clips.find((x) => x.id === id.split('#')[0])
+        if (!c || clipEnd(c) + 3 <= abs) {
+          await r.dispose()
+          videoReaders.delete(id)
         }
-        let r = videoReaders.get(c.id)
-        if (!r) {
-          const m = await pool.get(c.assetId)
-          if (!m.video) return
-          const [dw, dh] = await Promise.all([m.video.getDisplayWidth(), m.video.getDisplayHeight()])
-          const size = containSize(dw, dh, W, H)
-          r = new VideoReader(m.video, size.w, size.h, 3)
-          videoReaders.set(c.id, r)
-        }
-        const f = await r.frameAt(src)
-        if (f) frames.set(c.id, { image: f.canvas, width: f.canvas.width, height: f.canvas.height })
-      }),
-    )
-    timings.decodeWait += now() - td
-
-    const tc = now()
-    if (offX > 0.5 || offY > 0.5) {
-      ctx.fillStyle = '#000'
-      ctx.fillRect(0, 0, W, H)
-    }
-    ctx.save()
-    ctx.translate(offX, offY)
-    drawFrame(ctx, project, abs, frames, projScale)
-    ctx.restore()
-    timings.composite += now() - tc
-
-    const te = now()
-    probe.markSubmit(rel)
-    await videoSource.add(rel, 1 / s.fps)
-    timings.videoEncodeWait += now() - te
-
-    // Free readers for clips that are well past their end (transitions can read a little beyond it).
-    for (const [id, r] of videoReaders) {
-      const c = project.clips.find((x) => x.id === id)
-      if (!c || clipEnd(c) + 3 <= abs) {
-        await r.dispose()
-        videoReaders.delete(id)
       }
+
+      await pushAudioUntil(rel + 1 / s.fps + 0.1)
+      report(rel)
     }
 
-    await pushAudioUntil(rel + 1 / s.fps + 0.1)
-    report(rel)
-  }
+    // Audio-only exports (or remaining audio tail).
+    while (audioSource && audioPos < audioTotal) {
+      await abortIfNeeded()
+      await pushAudioUntil(audioTime + 1)
+      report(audioTime)
+    }
 
-  // Audio-only exports (or remaining audio tail).
-  while (audioSource && audioPos < audioTotal) {
-    await abortIfNeeded()
-    await pushAudioUntil(audioTime + 1)
-    report(audioTime)
-  }
+    for (const r of videoReaders.values()) await r.dispose()
+    for (const r of audioReaders.values()) await r.dispose()
+    videoReaders.clear()
+    audioReaders.clear()
 
-  for (const r of videoReaders.values()) await r.dispose()
-  for (const r of audioReaders.values()) await r.dispose()
+    const tf = now()
+    await output.finalize()
+    timings.finalize = now() - tf
+    const buffer = await handle.finish()
+    await pool.dispose()
+    pool = null
+    heap.sample()
+    timings.total = now() - t0
+    hooks.onProgress?.({ progress: 1, processedTime: duration })
 
-  const tf = now()
-  await output.finalize()
-  timings.finalize = now() - tf
-  const buffer = await handle.finish()
-  await pool.dispose()
-  heap.sample()
-  timings.total = now() - t0
-  hooks.onProgress?.({ progress: 1, processedTime: duration })
-
-  return {
-    timings,
-    encoder: probe.finish(),
-    frames: frameCount,
-    mediaDuration: duration,
-    outputBytes: buffer?.byteLength ?? handle.bytes(),
-    buffer,
-    mimeType: format.mimeType,
-    tracks: { video: wantVideo, audio: wantAudio }, // what the job set out to write (the verifier checks the file has them)
-    fileName: fileNameFor(baseName, s),
-    peakHeapMB: heap.peak,
-    context: isWorker ? 'worker' : 'main',
+    return {
+      timings,
+      encoder: probe.finish(),
+      frames: frameCount,
+      mediaDuration: duration,
+      outputBytes: buffer?.byteLength ?? handle.bytes(),
+      buffer,
+      mimeType: format.mimeType,
+      tracks: { video: wantVideo, audio: wantAudio }, // what the job set out to write (the verifier checks the file has them)
+      // how long each track should last: video is a whole number of frames, audio covers the exact range
+      trackDurations: { video: wantVideo ? frameCount / s.fps : null, audio: wantAudio ? duration : null },
+      fileName: fileNameFor(baseName, s),
+      peakHeapMB: heap.peak,
+      context: isWorker ? 'worker' : 'main',
+    }
+  } catch (err) {
+    // Failure or cancel: stop the encoders and discard the file, so nothing is left open or half-written.
+    await output?.cancel().catch(() => {})
+    await handle.fail(err)
+    throw err
+  } finally {
+    // readers and decoders are released on every path (in worker mode the worker dies anyway; on the main thread
+    // they would otherwise leak into later runs)
+    for (const r of videoReaders.values()) await r.dispose().catch(() => {})
+    for (const r of audioReaders.values()) await r.dispose().catch(() => {})
+    await pool?.dispose().catch(() => {})
   }
 }
 
@@ -470,12 +500,27 @@ async function exportProject(project, s, range, jobTarget, baseName, hooks) {
 
 async function runConversion(job, hooks) {
   const t0 = now()
+  const handle = await makeTarget(job.target)
+  const input = openInput(job.asset.file)
+  const ctx = { output: null }
+  try {
+    return await convertWith(job, hooks, t0, handle, input, ctx)
+  } catch (err) {
+    // invalid conversion, encoder/decoder/disk failure or cancel: stop the output and discard the file
+    await ctx.output?.cancel().catch(() => {})
+    await handle.fail(err)
+    throw err
+  } finally {
+    input.dispose()
+  }
+}
+
+async function convertWith(job, hooks, t0, handle, input, ctx) {
   const s = job.settings
   const heap = new HeapTracker()
-  const handle = await makeTarget(job.target)
   const format = makeOutputFormat(s.container, handle.kind)
-  const input = openInput(job.asset.file)
   const output = new Output({ format, target: handle.target })
+  ctx.output = output
   const src = job.asset.info
   const wantVideo = !!s.videoCodec && format.getSupportedVideoCodecs().length > 0 && !!src.video
   const wantAudio = !!s.audioCodec && !!src.audio
@@ -538,7 +583,6 @@ async function runConversion(job, hooks) {
     reason: d.reason,
   }))
   if (!conversion.isValid) {
-    input.dispose()
     throw new Error(`Conversion is not possible: ${discarded.map((d) => `${d.type} ${d.codec ?? '?'} → ${d.reason}`).join('; ') || 'unknown reason'}`)
   }
   const setup = now() - t0
@@ -566,7 +610,6 @@ async function runConversion(job, hooks) {
     hooks.signal?.removeEventListener('abort', onAbort)
   }
   const buffer = await handle.finish()
-  input.dispose()
   heap.sample()
   const mediaDuration = trimEnd - job.trim.start
   const total = now() - t0
@@ -580,6 +623,11 @@ async function runConversion(job, hooks) {
     buffer,
     mimeType: format.mimeType,
     tracks: { video: wantVideo, audio: wantAudio }, // what the job set out to write (the verifier checks the file has them)
+    // per track: a source's tracks can end at different times (AAC priming makes audio ~20 ms longer)
+    trackDurations: {
+      video: wantVideo ? Math.min(trimEnd, src.video.duration ?? trimEnd) - job.trim.start : null,
+      audio: wantAudio ? Math.min(trimEnd, src.audio.duration ?? trimEnd) - job.trim.start : null,
+    },
     fileName: fileNameFor(job.asset.name, s),
     conversion: {
       discarded,
@@ -643,7 +691,8 @@ async function runFixture(job) {
   let vs = null
   let as = null
   if (sp.videoCodec) {
-    vs = new CanvasSource(canvas, { codec: sp.videoCodec, bitrate: QUALITY_HIGH, keyFrameInterval: 1 })
+    // GOP: 1 s by default (the original fixtures); camera-like fixtures use longer GOPs (spec.keyFrameInterval)
+    vs = new CanvasSource(canvas, { codec: sp.videoCodec, bitrate: QUALITY_HIGH, keyFrameInterval: sp.keyFrameInterval ?? 1 })
     output.addVideoTrack(vs, { frameRate: sp.fps })
   }
   if (sp.audioCodec) {
@@ -674,16 +723,18 @@ async function runFixture(job) {
       audioT += n / rate
     }
   }
+  const camera = sp.content === 'camera' ? makeCameraTexture(sp.width, sp.height) : null
   for (let i = 0; i < frames; i++) {
     const t = i / sp.fps
     drawFixtureFrame(ctx, sp.width, sp.height, t, i, sp.duration)
+    if (camera) drawCameraDetail(ctx, sp.width, sp.height, i, camera)
     await vs.add(t, 1 / sp.fps)
     await pushAudio(t + 0.2)
   }
   await pushAudio(sp.duration)
   await output.finalize()
   const buffer = target.buffer
-  const name = sp.name ?? `test_${sp.width}x${sp.height}_${sp.fps}fps_${sp.duration}s_${sp.videoCodec ?? 'novideo'}_${sp.audioCodec ?? 'noaudio'}`
+  const name = sp.name ?? `test_${sp.width}x${sp.height}_${sp.fps}fps_${sp.duration}s_${sp.videoCodec ?? 'novideo'}_${sp.audioCodec ?? 'noaudio'}${sp.content === 'camera' ? '_camera' : ''}`
   return {
     timings: { total: now() - t0 },
     encoder: null,
@@ -695,6 +746,78 @@ async function runFixture(job) {
     fileName: `${name}${containerDef(sp.container).ext}`,
     peakHeapMB: null,
     context: isWorker ? 'worker' : 'main',
+  }
+}
+
+/**
+ * "Camera-like" content (spec.content = 'camera'): the plain fixtures are smooth gradients and flat shapes that
+ * encoders compress trivially. This adds what real footage has: fine detail that pans (motion search), and fresh
+ * sensor noise every frame (no two frames alike, so inter prediction can't skip it). Still synthetic: no faces,
+ * foliage or real camera motion, so treat its numbers as "harder", not "real".
+ */
+function makeCameraTexture(w, h) {
+  const rnd = mulberry32(12345)
+  const noise = []
+  for (let k = 0; k < 4; k++) {
+    const c = new OffscreenCanvas(256, 256)
+    const x = c.getContext('2d')
+    const img = x.createImageData(256, 256)
+    for (let i = 0; i < img.data.length; i += 4) {
+      const v = 128 + (rnd() - 0.5) * 255
+      img.data[i] = img.data[i + 1] = img.data[i + 2] = v
+      img.data[i + 3] = 255
+    }
+    x.putImageData(img, 0, 0)
+    noise.push(c)
+  }
+  // fine detail: thin lines and dots in many sizes (like foliage / fabric / text at a distance)
+  const tw = Math.round(w * 1.5)
+  const th = Math.round(h * 1.5)
+  const detail = new OffscreenCanvas(tw, th)
+  const d = detail.getContext('2d')
+  d.fillStyle = '#000'
+  d.fillRect(0, 0, tw, th)
+  for (let i = 0; i < 6000; i++) {
+    d.strokeStyle = `hsla(${rnd() * 360}, 60%, ${30 + rnd() * 50}%, 0.9)`
+    d.lineWidth = 0.5 + rnd() * 2
+    const x = rnd() * tw
+    const y = rnd() * th
+    const a = rnd() * Math.PI
+    const l = 4 + rnd() * 24
+    d.beginPath()
+    d.moveTo(x, y)
+    d.lineTo(x + Math.cos(a) * l, y + Math.sin(a) * l)
+    d.stroke()
+  }
+  return { noise, detail, tw, th }
+}
+
+function drawCameraDetail(ctx, w, h, frame, cam) {
+  ctx.save()
+  // slow diagonal pan across the detail layer, blended over the base picture
+  ctx.globalAlpha = 0.45
+  ctx.globalCompositeOperation = 'screen'
+  const px = ((frame * 2.3) % (cam.tw - w)) | 0
+  const py = ((frame * 1.1) % (cam.th - h)) | 0
+  ctx.drawImage(cam.detail, -px, -py)
+  // per-frame sensor noise: tiled, with a different tile and offset each frame
+  ctx.globalCompositeOperation = 'overlay'
+  ctx.globalAlpha = 0.18
+  const tile = cam.noise[frame % cam.noise.length]
+  const ox = (frame * 97) % 256
+  const oy = (frame * 61) % 256
+  for (let y = -oy; y < h; y += 256) for (let x = -ox; x < w; x += 256) ctx.drawImage(tile, x, y)
+  ctx.restore()
+}
+
+/** Small seeded PRNG so camera fixtures are identical on every run. */
+function mulberry32(seed) {
+  return () => {
+    seed |= 0
+    seed = (seed + 0x6d2b79f5) | 0
+    let t = Math.imul(seed ^ (seed >>> 15), 1 | seed)
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296
   }
 }
 

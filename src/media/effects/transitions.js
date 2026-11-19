@@ -75,9 +75,46 @@ export const transitionLabel = (t) => TRANSITIONS.find((x) => x.id === t)?.label
 /** Draws one side (A = outgoing, B = incoming). Returns the side's drawn rect, or null when absent. */
 /** Both ways to get a side: draw it in place, or render it into a full-frame layer (released by the caller). */
 /**
+ * Cross-dissolve: (1 − p)·A + p·B over whatever is below, for any pair of sides.
+ * - B opaque and covering A (the common full-frame video cut): draw A, then B at p — exact and cheap.
+ * - Both sides present otherwise: A at (1 − p) and B at p are rendered into layers and summed ('lighter'),
+ *   then composited once, so there is no dark midpoint and A still fades where B doesn't cover it.
+ * - One side only (edge transition): the outgoing side fades out / the incoming side fades in.
+ * Without `sides` (legacy callers) `opaqueA` keeps the old behaviour.
+ */
+function crossDissolve(ctx, p, drawA, drawB, opaqueA, sides, mA = {}, mB = {}) {
+  if (sides) {
+    if (sides.hasA && sides.hasB && sides.bCoversA()) {
+      drawA(mA)
+      drawB({ ...mB, alpha: p })
+      return
+    }
+    if (sides.mixable) {
+      const la = sides.layerA({ ...mA, alpha: 1 - p })
+      const lb = sides.layerB({ ...mB, alpha: p })
+      la.ctx.save()
+      la.ctx.setTransform(1, 0, 0, 1, 0, 0)
+      la.ctx.globalAlpha = 1
+      la.ctx.globalCompositeOperation = 'lighter'
+      la.ctx.drawImage(lb.canvas, 0, 0)
+      la.ctx.restore()
+      ctx.save()
+      ctx.globalAlpha = 1
+      ctx.drawImage(la.canvas, 0, 0)
+      ctx.restore()
+      return
+    }
+    drawA({ ...mA, alpha: 1 - p })
+    drawB({ ...mB, alpha: p })
+    return
+  }
+  drawA({ ...mA, alpha: opaqueA ? 1 : 1 - p })
+  drawB({ ...mB, alpha: p })
+}
+
+/**
  * Draw a transition at eased progress `p` (0 → all A, 1 → all B) over a W×H canvas area.
- * `opaqueA` = A fully covers what it overlaps (video), so dissolves can keep it at full alpha
- * (prevents a dark midpoint); transparent graphics fade out instead.
+ * `opaqueA` (used only without `sides`) = A fully covers what B overlaps, so dissolves keep it at full alpha.
  */
 export function drawTransition(ctx, type, p, W, H, drawA, drawB, opaqueA, sides, t = 0) {
   const fx = FX_TRANSITIONS[type]
@@ -87,13 +124,14 @@ export function drawTransition(ctx, type, p, W, H, drawA, drawB, opaqueA, sides,
   }
   switch (type) {
     case 'dissolve':
-      drawA({ alpha: opaqueA ? 1 : 1 - p })
-      drawB({ alpha: p })
+      crossDissolve(ctx, p, drawA, drawB, opaqueA, sides)
       return
-    case 'blur':
-      drawA({ alpha: opaqueA ? 1 : 1 - p, blur: p * W * 0.012 })
-      drawB({ alpha: p, blur: (1 - p) * W * 0.012 })
+    case 'blur': {
+      // a blurred B has soft edges, so it never "covers" A: always mix
+      const noCover = sides ? { ...sides, bCoversA: () => false } : sides
+      crossDissolve(ctx, p, drawA, drawB, opaqueA, noCover, { blur: p * W * 0.012 }, { blur: (1 - p) * W * 0.012 })
       return
+    }
     case 'dip-black':
     case 'dip-white': {
       const color = type === 'dip-black' ? '#000000' : '#ffffff'
@@ -146,13 +184,12 @@ export function drawTransition(ctx, type, p, W, H, drawA, drawB, opaqueA, sides,
       drawA({ alpha: 1 - p, scale: 1 + 0.6 * p })
       return
     case 'zoom-out':
-      drawA({ alpha: opaqueA ? 1 : 1 - p, scale: 1 - 0.35 * p })
-      drawB({ alpha: p, scale: 1.35 - 0.35 * p })
+      // B only grows (≥ 1) and A only shrinks (≤ 1), so "B covers A" at rest still holds
+      crossDissolve(ctx, p, drawA, drawB, opaqueA, sides, { scale: 1 - 0.35 * p }, { scale: 1.35 - 0.35 * p })
       return
     default:
       // unknown id (e.g. from a newer save): fall back to a dissolve
-      drawA({ alpha: opaqueA ? 1 : 1 - p })
-      drawB({ alpha: p })
+      crossDissolve(ctx, p, drawA, drawB, opaqueA, sides)
       return
     case 'circle': {
       drawA()

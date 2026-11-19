@@ -95,20 +95,54 @@ export function defaultEncodeSettings(p) {
   }
 }
 
+/** Drop-frame timecode applies to the NTSC rates (29.97, 59.94): 2 or 4 frame numbers skipped each minute except every 10th. */
+function dropFrameInfo(fps) {
+  const nominal = Math.round(fps)
+  if (Math.abs(fps - nominal) < 1e-6 || Math.abs(fps * 1.001 - nominal) > 1e-3 || nominal % 30 !== 0) return null
+  return { nominal, drop: (nominal / 30) * 2 }
+}
+
+/**
+ * Timeline time → timecode. NTSC rates (29.97/59.94) use SMPTE drop-frame ("HH:MM:SS;FF"), so the label
+ * tracks wall-clock time; other fractional rates (23.976) use exact-rate math (HH:MM:SS of real time plus
+ * the frame number within that second). Integer rates are plain non-drop timecode.
+ */
 export function formatTimecode(t, fps) {
   const sign = t < 0 ? '-' : ''
   t = Math.abs(t)
-  const totalFrames = Math.round(t * fps)
-  const f = totalFrames % Math.round(fps)
-  const s = Math.floor(totalFrames / Math.round(fps))
+  const pad = (n, w = 2) => String(n).padStart(w, '0')
+  const frame = Math.floor(t * fps + 1e-6)
+  const df = dropFrameInfo(fps)
+  if (df) {
+    const { nominal, drop } = df
+    const per10 = Math.round(fps * 600)
+    const perMin = nominal * 60 - drop
+    const d = Math.floor(frame / per10)
+    const m = frame % per10
+    const fn = frame + drop * 9 * d + (m > drop ? drop * Math.floor((m - drop) / perMin) : 0)
+    const ff = fn % nominal
+    const ss = Math.floor(fn / nominal) % 60
+    const mm = Math.floor(fn / (nominal * 60)) % 60
+    const hh = Math.floor(fn / (nominal * 3600))
+    return `${sign}${pad(hh)}:${pad(mm)}:${pad(ss)};${pad(ff)}`
+  }
+  let s
+  let f
+  if (Number.isInteger(fps)) {
+    s = Math.floor(frame / fps)
+    f = frame % fps
+  } else {
+    // exact rate: whole seconds of real time, and the frames elapsed since that second began
+    s = Math.floor(t + 1e-9)
+    f = Math.floor((t - s) * fps + 1e-6)
+  }
   const hh = Math.floor(s / 3600)
   const mm = Math.floor((s % 3600) / 60)
   const ss = s % 60
-  const pad = (n, w = 2) => String(n).padStart(w, '0')
   return `${sign}${pad(hh)}:${pad(mm)}:${pad(ss)}:${pad(f)}`
 }
 
-/** Parses "1:23:10", "83.5", "+2s", "-10f", "00:00:05:12" relative to `current`. */
+/** Parses "1:23:10", "83.5", "+2s", "-10f", "00:00:05:12", "00:10:00;00" (drop-frame) relative to `current`. */
 export function parseTimecode(input, fps, current) {
   const s = input.trim()
   const rel = /^([+-])\s*(\d+(?:\.\d+)?)\s*(s|f)?$/i.exec(s)
@@ -117,8 +151,15 @@ export function parseTimecode(input, fps, current) {
     return current + (rel[1] === '-' ? -v : v)
   }
   if (/^\d+(\.\d+)?$/.test(s)) return parseFloat(s)
-  const parts = s.split(':').map((x) => parseFloat(x))
+  const parts = s.split(/[:;]/).map((x) => parseFloat(x))
   if (parts.some((x) => Number.isNaN(x))) return null
+  const df = dropFrameInfo(fps)
+  if (parts.length === 4 && df) {
+    const [hh, mm, ss, ff] = parts
+    const minutes = hh * 60 + mm
+    const fn = (hh * 3600 + mm * 60 + ss) * df.nominal + ff - df.drop * (minutes - Math.floor(minutes / 10))
+    return fn / fps
+  }
   if (parts.length === 4) return parts[0] * 3600 + parts[1] * 60 + parts[2] + parts[3] / fps
   if (parts.length === 3) return parts[0] * 60 + parts[1] + parts[2] / fps
   if (parts.length === 2) return parts[0] * 60 + parts[1]

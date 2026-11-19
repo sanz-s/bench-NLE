@@ -26,7 +26,8 @@ export function TopBar() {
     return () => clearInterval(t)
   }, [])
 
-  const job = jobs[0]
+  const job = jobs.find((j) => j.status !== 'queued') ?? jobs[0]
+  const queued = jobs.filter((j) => j !== job && j.status === 'queued')
   return (
     <header className="topbar">
       <div className="brand" aria-label="Bunny NLE">
@@ -97,12 +98,28 @@ export function TopBar() {
       )}
       <IconButton icon="keyboard" label="Keyboard shortcuts" shortcut="?" onClick={() => setState({ dialog: { type: 'shortcuts' } })} />
       {job && (
-        <div className="job-pill" title={`${job.label} (${job.runIn})`}>
+        <div
+          className="job-pill"
+          title={`${job.label} (${job.runIn})${queued.length ? `\nQueued (runs after this one, so benchmarks never overlap):\n${queued.map((j) => j.label).join('\n')}` : ''}`}
+        >
           <div className="job-bar" style={{ width: `${Math.round(job.progress * 100)}%` }} />
-          <span>{Math.round(job.progress * 100)}%</span>
+          <span>
+            {Math.round(job.progress * 100)}%{queued.length ? ` · ${queued.length} queued` : ''}
+          </span>
           <button type="button" className="job-cancel" onClick={job.cancel} aria-label="Cancel job" title="Cancel">
             <Icon name="x" size={12} />
           </button>
+          {queued.length > 0 && (
+            <button
+              type="button"
+              className="job-cancel"
+              onClick={() => queued.forEach((j) => j.cancel())}
+              aria-label="Cancel queued jobs"
+              title="Cancel queued jobs"
+            >
+              <Icon name="trash" size={12} />
+            </button>
+          )}
         </div>
       )}
       <button type="button" className="btn btn-primary export-btn" onClick={() => setState({ dialog: { type: 'export' } })} title="Export (⌘E)">
