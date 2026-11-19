@@ -88,7 +88,13 @@
   .chart-title { font-weight: 600; font-size: 12.5px; }
   .legend { display: flex; gap: 12px; flex-wrap: wrap; font-size: 11.5px; color: var(--text-2); }
   .legend span { display: inline-flex; align-items: center; gap: 5px; }
-  .chart canvas { display: block; width: 100%; height: 170px; }
+  .chart canvas { display: block; width: 100%; height: 170px; touch-action: pan-y; cursor: crosshair; }
+  .chart canvas.zoomed { cursor: grab; }
+  .chart canvas.panning { cursor: grabbing; }
+  .zoombar { grid-column: 1 / -1; display: flex; align-items: center; gap: 6px; flex-wrap: wrap; font-size: 11.5px; color: var(--text-2); }
+  .zoombar .btn { height: 26px; padding: 0 9px; }
+  .zoombar .range { font-family: var(--mono); color: var(--text); }
+  .zoombar .hint { color: var(--text-3); }
   .tip { position: absolute; pointer-events: none; z-index: 5; background: #0d0e10; border: 1px solid var(--line-2); border-radius: 6px; padding: 6px 8px; font-size: 11.5px; white-space: nowrap; box-shadow: 0 8px 24px rgba(0, 0, 0, 0.45); display: none; }
   .tip .row { display: flex; align-items: center; gap: 6px; }
   .tip b { font-family: var(--mono); font-weight: 600; }
@@ -229,7 +235,12 @@ function drawChart(cv, opts) {
   const all = opts.series.flatMap((s) => s.points.map((p) => p.v)).filter((v) => v != null)
   const yMax = opts.yMax ?? niceMax(all.length ? Math.max(...all) : 0, opts.yFloor ?? 1)
   const tMax = Math.max(opts.tMax ?? 0, ...opts.series.flatMap((s) => s.points.map((p) => p.t)), 1000)
-  const x = (t) => L + (t / tMax) * pw
+  // x range: the chart group's zoom window (shared by the charts of one view), or the whole job
+  const z = cv._zoom
+  if (z) z.tMax = Math.max(z.tMax ?? 0, tMax)
+  const [t0, t1] = viewRange(z, tMax)
+  const span = t1 - t0
+  const x = (t) => L + ((t - t0) / span) * pw
   const y = (v) => T + ph - (Math.min(v, yMax) / yMax) * ph
   // grid + y labels (recessive)
   ctx.font = '10.5px ui-monospace, Menlo, monospace'
@@ -247,14 +258,25 @@ function drawChart(cv, opts) {
   // x labels (seconds)
   ctx.textAlign = 'center'
   ctx.textBaseline = 'top'
-  const stepS = [0.5, 1, 2, 5, 10, 15, 30, 60, 120, 300].find((s) => (s * 1000 / tMax) * pw >= 55) ?? 600
-  for (let s = 0; s * 1000 <= tMax + 1; s += stepS) ctx.fillText(`${s}s`, x(s * 1000), T + ph + 6)
-  // series
-  for (const s of opts.series) {
+  const stepS = [0.1, 0.2, 0.5, 1, 2, 5, 10, 15, 30, 60, 120, 300, 600, 900, 1800].find((s) => ((s * 1000) / span) * pw >= 55) ?? 3600
+  const dec = stepS < 1 ? 1 : 0
+  for (let k = Math.ceil(t0 / 1000 / stepS - 1e-9); k * stepS * 1000 <= t1 + 1; k++) {
+    const sec = k * stepS
+    const xx = x(sec * 1000)
+    if (xx < L - 1 || xx > w - R + 1) continue
+    ctx.fillText(`${sec.toFixed(dec)}s`, xx, T + ph + 6)
+  }
+  // series (clipped to the plot; only points in the window, plus one either side so lines reach the edges)
+  ctx.save()
+  ctx.beginPath()
+  ctx.rect(L, T - 2, pw, ph + 4)
+  ctx.clip()
+  for (const s0 of opts.series) {
+    const s = { ...s0, points: inWindow(s0.points, t0 - (s0.barWidthMs ?? 0), t1 + (s0.barWidthMs ?? 0)) }
     ctx.fillStyle = s.color
     ctx.strokeStyle = s.color
     if (s.kind === 'bar') {
-      const bw = Math.max(2, (s.barWidthMs / tMax) * pw - 2) // 2px surface gap between bars
+      const bw = Math.max(2, (s.barWidthMs / span) * pw - 2) // 2px surface gap between bars
       for (const p of s.points) {
         if (!p.v) continue
         const x0 = x(p.t - s.barWidthMs) + 1
@@ -273,9 +295,182 @@ function drawChart(cv, opts) {
       if (pts.length === 1) { ctx.beginPath(); ctx.arc(x(pts[0].t), y(pts[0].v), 4, 0, Math.PI * 2); ctx.fill() }
     }
   }
+  // drag-to-zoom selection
+  if (cv._brush) {
+    const a = x(Math.min(cv._brush.a, cv._brush.b))
+    const b = x(Math.max(cv._brush.a, cv._brush.b))
+    ctx.fillStyle = 'rgba(91, 140, 255, 0.16)'
+    ctx.fillRect(a, T, b - a, ph)
+    ctx.strokeStyle = 'rgba(91, 140, 255, 0.7)'
+    ctx.lineWidth = 1
+    ctx.strokeRect(Math.round(a) + 0.5, T + 0.5, Math.round(b - a), ph - 1)
+  }
+  ctx.restore()
   // hover state
-  cv._chart = { opts, x, y, L, R, T, B, pw, ph, tMax, yMax }
-  if (cv._hoverT != null) drawCrosshair(cv)
+  cv._chart = { opts, x, y, L, R, T, B, pw, ph, tMax, yMax, t0, t1, span }
+  cv.classList.toggle('zoomed', !!(z && z.t1 != null))
+  if (cv._hoverT != null && !cv._brush && !cv._pan) drawCrosshair(cv)
+}
+
+/** Points with t in [a, b], plus the nearest one outside each end (so lines continue to the plot edge). */
+function inWindow(points, a, b) {
+  let i0 = 0
+  while (i0 < points.length && points[i0].t < a) i0++
+  let i1 = i0
+  while (i1 < points.length && points[i1].t <= b) i1++
+  return points.slice(Math.max(0, i0 - 1), Math.min(points.length, i1 + 1))
+}
+
+// ---------------------------------------------------------------- x-axis zoom & pan (shared by one view's charts)
+const MIN_SPAN_MS = 1000
+
+/** The visible [t0, t1] of a zoom group. A window touching the right edge follows new live data. */
+function viewRange(z, tMax) {
+  if (!z || z.t1 == null) return [0, tMax]
+  let span = Math.max(MIN_SPAN_MS, z.t1 - z.t0)
+  if (span >= tMax) return [0, tMax]
+  if (z.follow) {
+    z.t1 = tMax
+    z.t0 = tMax - span
+  }
+  z.t0 = Math.max(0, Math.min(z.t0, tMax - span))
+  z.t1 = z.t0 + span
+  return [z.t0, z.t1]
+}
+
+function zoomGroup(root) {
+  root._zoomGroup ??= { t0: null, t1: null, follow: false, tMax: 0, canvases: new Set(), bar: null }
+  return root._zoomGroup
+}
+
+/** Set the window (clamped), or reset to the whole job when it covers everything. */
+function setView(z, t0, t1) {
+  const tMax = z.tMax || 1000
+  const span = Math.max(MIN_SPAN_MS, t1 - t0)
+  if (span >= tMax) {
+    z.t0 = z.t1 = null
+    z.follow = false
+  } else {
+    z.t0 = Math.max(0, Math.min(t0, tMax - span))
+    z.t1 = z.t0 + span
+    z.follow = z.t1 >= tMax - 1
+  }
+  redrawGroup(z)
+}
+
+function zoomBy(z, factor, anchor) {
+  const [t0, t1] = viewRange(z, z.tMax || 1000)
+  const span = t1 - t0
+  const a = anchor ?? (t0 + t1) / 2
+  const next = Math.min(z.tMax, Math.max(MIN_SPAN_MS, span * factor))
+  setView(z, a - ((a - t0) / span) * next, a - ((a - t0) / span) * next + next)
+}
+
+function panBy(z, dt) {
+  if (z.t1 == null) return
+  setView(z, z.t0 + dt, z.t1 + dt)
+}
+
+function redrawGroup(z) {
+  for (const cv of z.canvases) {
+    if (!cv.isConnected) z.canvases.delete(cv)
+    else if (cv._chart) drawChart(cv, cv._chart.opts)
+  }
+  if (z.bar?.isConnected) {
+    const [t0, t1] = viewRange(z, z.tMax || 1000)
+    z.bar.querySelector('.range').textContent = z.t1 == null ? `all ${fmtSec(z.tMax)}` : `${(t0 / 1000).toFixed(1)}–${(t1 / 1000).toFixed(1)} s of ${fmtSec(z.tMax)}${z.follow ? ' · following live' : ''}`
+    z.bar.querySelector('[data-z="reset"]').disabled = z.t1 == null
+    z.bar.querySelector('[data-z="out"]').disabled = z.t1 == null
+  }
+}
+
+/** Zoom buttons + current range, placed as the first row of a .charts grid. */
+function zoomBarHTML() {
+  return `<div class="zoombar" role="toolbar" aria-label="Time axis zoom">
+    <span>Time axis</span>
+    <button type="button" class="btn" data-z="out" title="Zoom out" aria-label="Zoom out">−</button>
+    <button type="button" class="btn" data-z="in" title="Zoom in" aria-label="Zoom in">+</button>
+    <button type="button" class="btn" data-z="reset" title="Show the whole job (or double-click a chart)">Reset</button>
+    <span class="range"></span>
+    <span class="hint">· drag across a chart to zoom into that part · ⌘/Ctrl + scroll or pinch to zoom · when zoomed, drag or swipe sideways to pan · double-click resets</span>
+  </div>`
+}
+
+function bindZoomBar(root, z) {
+  z.bar = root.querySelector('.zoombar')
+  z.bar.querySelector('[data-z="in"]').onclick = () => zoomBy(z, 0.5)
+  z.bar.querySelector('[data-z="out"]').onclick = () => zoomBy(z, 2)
+  z.bar.querySelector('[data-z="reset"]').onclick = () => setView(z, 0, Infinity)
+}
+
+/** Pointer + wheel handlers that drive the canvas's zoom group. */
+function attachZoom(cv, z) {
+  cv._zoom = z
+  z.canvases.add(cv)
+  if (cv._zoomBound) return
+  cv._zoomBound = true
+  const tAt = (clientX) => {
+    const c = cv._chart
+    const r = cv.getBoundingClientRect()
+    return c.t0 + ((Math.min(Math.max(clientX - r.left, c.L), c.L + c.pw) - c.L) / c.pw) * c.span
+  }
+  cv.addEventListener(
+    'wheel',
+    (e) => {
+      const c = cv._chart
+      if (!c) return
+      if (e.ctrlKey || e.metaKey) {
+        // pinch (Chrome reports it as ctrl+wheel) or ⌘/Ctrl + scroll: zoom around the pointer
+        e.preventDefault()
+        zoomBy(cv._zoom, Math.exp(Math.max(-60, Math.min(60, e.deltaY)) * 0.01), tAt(e.clientX))
+      } else if (cv._zoom.t1 != null && (e.shiftKey || Math.abs(e.deltaX) > Math.abs(e.deltaY))) {
+        e.preventDefault()
+        const d = e.shiftKey && !e.deltaX ? e.deltaY : e.deltaX
+        panBy(cv._zoom, (d / c.pw) * c.span)
+      }
+    },
+    { passive: false },
+  )
+  cv.addEventListener('pointerdown', (e) => {
+    const c = cv._chart
+    if (!c || e.button !== 0) return
+    const r = cv.getBoundingClientRect()
+    const px = e.clientX - r.left
+    if (px < c.L || px > c.L + c.pw) return
+    cv.setPointerCapture(e.pointerId)
+    $('#tip').style.display = 'none'
+    // zoomed: drag pans (Shift+drag still selects); whole view: drag selects a range to zoom into
+    if (cv._zoom.t1 != null && !e.shiftKey) {
+      cv._pan = { x: e.clientX, t0: cv._zoom.t0, t1: cv._zoom.t1 }
+      cv.classList.add('panning')
+    } else cv._brush = { a: tAt(e.clientX), b: tAt(e.clientX), x: e.clientX }
+  })
+  cv.addEventListener('pointermove', (e) => {
+    const c = cv._chart
+    if (!c) return
+    if (cv._pan) {
+      const dt = -((e.clientX - cv._pan.x) / c.pw) * (cv._pan.t1 - cv._pan.t0)
+      setView(cv._zoom, cv._pan.t0 + dt, cv._pan.t1 + dt)
+    } else if (cv._brush) {
+      cv._brush.b = tAt(e.clientX)
+      drawChart(cv, c.opts)
+    }
+  })
+  const end = (e) => {
+    if (cv._pan) {
+      cv._pan = null
+      cv.classList.remove('panning')
+    }
+    if (cv._brush) {
+      const b = cv._brush
+      cv._brush = null
+      if (Math.abs(e.clientX - b.x) >= 6) setView(cv._zoom, Math.min(b.a, b.b), Math.max(b.a, b.b))
+      else if (cv._chart) drawChart(cv, cv._chart.opts)
+    }
+  }
+  cv.addEventListener('pointerup', end)
+  cv.addEventListener('pointercancel', end)
+  cv.addEventListener('dblclick', () => setView(cv._zoom, 0, Infinity))
 }
 
 function roundTop(ctx, x, y, w, h, r) {
@@ -325,8 +520,9 @@ function attachHover(cv, format) {
     if (!c) return
     const r = cv.getBoundingClientRect()
     const px = e.clientX - r.left
+    if (cv._pan || cv._brush) return
     if (px < c.L || px > r.width - c.R) return leave()
-    cv._hoverT = ((px - c.L) / c.pw) * c.tMax
+    cv._hoverT = c.t0 + ((px - c.L) / c.pw) * c.span
     drawChart(cv, c.opts)
     const rows = c.opts.series.map((s) => {
       const pts = s.points.filter((q) => q.v != null)
@@ -350,15 +546,18 @@ function attachHover(cv, format) {
 /** Builds the 4 standard charts (CPU, GPU, main thread, memory) into a container from a job's series. */
 function renderSeriesCharts(root, series, tMax) {
   if (!root._built) {
-    root.innerHTML = `
+    root.innerHTML = `${zoomBarHTML()}
       <div class="chart"><div class="chart-head"><span class="chart-title">CPU</span><span class="legend"><span><i class="swatch" style="background:var(--c-cpu)"></i>System</span><span><i class="swatch" style="background:var(--c-chrome)"></i>Chrome (share of all cores)</span></span></div><canvas data-c="cpu"></canvas></div>
       <div class="chart"><div class="chart-head"><span class="chart-title">GPU utilization</span><span class="legend muted">whole GPU (ioreg)</span></div><canvas data-c="gpu"></canvas></div>
       <div class="chart"><div class="chart-head"><span class="chart-title">Main-thread blocking</span><span class="legend muted">long-task time per 0.5 s</span></div><canvas data-c="main"></canvas></div>
       <div class="chart"><div class="chart-head"><span class="chart-title">Chrome memory</span><span class="legend muted" data-l="mem">all browser processes (RSS)</span></div><canvas data-c="mem"></canvas></div>`
     root._built = true
-    root.querySelectorAll('canvas').forEach((cv) =>
-      attachHover(cv, (v, s) => (v == null ? '—' : s.unit === 'GB' ? `${v.toFixed(2)} GB` : s.unit === 'ms' ? `${Math.round(v)} ms` : `${v.toFixed(0)}%`)),
-    )
+    const z = zoomGroup(root)
+    bindZoomBar(root, z)
+    root.querySelectorAll('canvas').forEach((cv) => {
+      attachZoom(cv, z)
+      attachHover(cv, (v, s) => (v == null ? '—' : s.unit === 'GB' ? `${v.toFixed(2)} GB` : s.unit === 'ms' ? `${Math.round(v)} ms` : `${v.toFixed(0)}%`))
+    })
   }
   const S = series?.samples ?? []
   const M = series?.mainThread ?? []
@@ -371,6 +570,7 @@ function renderSeriesCharts(root, series, tMax) {
   const hasFp = S.some((s) => s.footprintMB != null)
   root.querySelector('[data-l="mem"]').textContent = hasFp ? 'browser processes, real footprint' : 'all browser processes (RSS, over-counts shared memory)'
   drawChart(cv('mem'), { tMax, yFloor: 1, unit: 'G', series: [{ name: hasFp ? 'Footprint' : 'RSS', color: css('--c-mem'), unit: 'GB', points: pt(hasFp ? 'footprintMB' : 'rssMB', 1 / 1024) }] })
+  redrawGroup(zoomGroup(root)) // range label (charts are already drawn)
 }
 
 // ---------------------------------------------------------------- live monitor
@@ -711,17 +911,22 @@ async function openCompare() {
           .join('')}</div>`
       })
       .join('')}</div>
-    <div class="charts" id="cmp-charts">
+    <div class="charts" id="cmp-charts">${zoomBarHTML()}
       <div class="chart"><div class="chart-head"><span class="chart-title">GPU over time</span><span class="legend">${recs.map((r, i) => `<span><i class="swatch" style="background:${color(i)}"></i>${i + 1}</span>`).join('')}</span></div><canvas data-c="gpu"></canvas></div>
       <div class="chart"><div class="chart-head"><span class="chart-title">System CPU over time</span><span class="legend">${recs.map((r, i) => `<span><i class="swatch" style="background:${color(i)}"></i>${i + 1}</span>`).join('')}</span></div><canvas data-c="cpu"></canvas></div>
     </div>`
   $('#close-detail').onclick = () => (el.hidden = true)
   const tMax = Math.max(...recs.map((r) => (r.meta.endedAt ?? 0) - r.meta.startedAt), 1000)
+  const zr = $('#cmp-charts')
+  const z = zoomGroup(zr)
+  bindZoomBar(zr, z)
   for (const key of ['gpu', 'cpu']) {
     const cv = $(`#cmp-charts canvas[data-c="${key}"]`)
+    attachZoom(cv, z)
     attachHover(cv, (v) => (v == null ? '—' : `${v.toFixed(0)}%`))
     drawChart(cv, { tMax, yMax: 100, unit: '%', series: recs.map((r, i) => ({ name: `${i + 1}`, color: css(RUN_SLOTS[i]), points: r.series.samples.map((s) => ({ t: s.t, v: s[key] })) })) })
   }
+  redrawGroup(z)
   el.scrollIntoView({ behavior: 'smooth', block: 'start' })
 }
 
