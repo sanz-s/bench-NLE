@@ -26,6 +26,17 @@ timeline, edit, and press **Export** (⌘E). Each export or conversion appears i
 can download the results as JSON or CSV.
 
 ## Automated benchmarks (Playwright)
+One command per OS checks the machine, starts the bench-server, builds, runs every scenario, then stops the server:
+```bash
+npm run bench:mac                     # macOS   (add -- --power for watts via sudo powermetrics)
+npm run bench:linux                   # Linux   (headless automatically when there is no display; --power = sudo for RAPL)
+npm run bench:win                     # Windows (sampler written but not yet verified on Windows hardware)
+npm run bench:mac -- --check          # machine checks only: browser, GPU source, power state, results file
+npm run bench:mac -- --scenario export-h264-worker --runs 5   # any bench/run.mjs flag passes through
+```
+A bench-server already running on :5199 is reused and left running; `--bench-port N` picks another port, `--no-server` skips CPU/GPU, `--no-build` reuses `dist/`.
+
+The lower-level commands:
 ```bash
 npm run bench                         # build → serve dist/ → headed Chrome → all scenarios × 3 runs
 npm run bench -- --scenario export-h264-worker,export-h264-main --runs 5

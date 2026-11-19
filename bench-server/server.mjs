@@ -19,7 +19,7 @@
  */
 import http from 'node:http'
 import os from 'node:os'
-import { appendFileSync, existsSync, mkdirSync, readFileSync, statSync, writeFileSync, promises as fsp } from 'node:fs'
+import { appendFileSync, chownSync, existsSync, mkdirSync, readFileSync, statSync, writeFileSync, promises as fsp } from 'node:fs'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { execFile, execFileSync, spawn } from 'node:child_process'
@@ -48,6 +48,22 @@ const USE_POWERMETRICS = flag('powermetrics') || flag('process-gpu')
 // when the ALL_TASKS total is above zero.
 const PROCESS_GPU = flag('process-gpu')
 const PLATFORM = process.platform
+const STARTED_AT = Date.now() // in /health, so launchers can tell a server older than its source
+
+/**
+ * Under `sudo` (needed for --powermetrics) every file the server creates would belong to root, and later non-sudo
+ * runs could no longer write them. Hand them back to the user who ran sudo.
+ */
+function ownByInvokingUser(file) {
+  const uid = Number(process.env.SUDO_UID)
+  const gid = Number(process.env.SUDO_GID)
+  if (process.getuid?.() !== 0 || !Number.isInteger(uid) || !Number.isInteger(gid)) return
+  try {
+    chownSync(file, uid, gid)
+  } catch {
+    /* gone or not ours to change */
+  }
+}
 const BIG = { maxBuffer: 32 * 1024 * 1024 }
 const { isBrowserExe } = P
 
@@ -236,7 +252,10 @@ function startProcstat() {
   const bin = path.join(NATIVE_DIR, 'procstat')
   try {
     const stale = !existsSync(bin) || statSync(bin).mtimeMs < statSync(src).mtimeMs
-    if (stale) execFileSync('clang', ['-O2', '-o', bin, src], { stdio: ['ignore', 'ignore', 'pipe'] })
+    if (stale) {
+      execFileSync('clang', ['-O2', '-o', bin, src], { stdio: ['ignore', 'ignore', 'pipe'] })
+      ownByInvokingUser(bin)
+    }
   } catch (e) {
     helper.error = `procstat build failed (${String(e.stderr ?? e.message).split('\n')[0]}); using ps (no footprint)`
     return
@@ -878,6 +897,8 @@ const RESULTS_DIR = process.env.BENCH_RESULTS_DIR ? path.resolve(process.env.BEN
 const RECORDS_FILE = path.join(RESULTS_DIR, 'exports.jsonl')
 const DASHBOARD_FILE = path.join(path.dirname(fileURLToPath(import.meta.url)), 'dashboard.html')
 mkdirSync(RESULTS_DIR, { recursive: true })
+ownByInvokingUser(RESULTS_DIR)
+if (existsSync(RECORDS_FILE)) ownByInvokingUser(RECORDS_FILE) // also repairs a file an older sudo run left root-owned
 
 /** @type {Map<string, any>} id → { id, savedAt, source, meta, report, series } */
 const records = new Map()
@@ -900,6 +921,7 @@ function persistError(e) {
 function persistAll() {
   try {
     writeFileSync(RECORDS_FILE, [...records.values()].map((r) => JSON.stringify(r)).join('\n') + (records.size ? '\n' : ''))
+    ownByInvokingUser(RECORDS_FILE)
   } catch (e) {
     persistError(e)
   }
@@ -1069,7 +1091,7 @@ const server = http.createServer(async (req, res) => {
     }
   }
   if (req.method === 'GET' && p === '/health') {
-    return send(res, 200, { ok: true, platform: process.platform, gpuSource, powermetrics: power.ok, intervalMs: INTERVAL, cores: os.cpus().length, cpuModel: os.cpus()[0]?.model ?? '', totalMemGB: os.totalmem() / 1073741824 })
+    return send(res, 200, { ok: true, platform: process.platform, startedAt: STARTED_AT, gpuSource, powermetrics: power.ok, intervalMs: INTERVAL, cores: os.cpus().length, cpuModel: os.cpus()[0]?.model ?? '', totalMemGB: os.totalmem() / 1073741824 })
   }
   if (req.method === 'GET' && p === '/live') return send(res, 200, latest ?? {})
 
@@ -1198,6 +1220,7 @@ const server = http.createServer(async (req, res) => {
         records.set(record.id, record)
         try {
           appendFileSync(RECORDS_FILE, JSON.stringify(record) + '\n')
+          ownByInvokingUser(RECORDS_FILE)
         } catch (e) {
           persistError(e)
         }
