@@ -49,7 +49,8 @@ npm run test:ui                       # editor smoke test through the real UI (+
 npm run test:regress                  # regression tests for the audited defects
 sudo npm run bench:server -- --powermetrics   # adds GPU/CPU power (W) + GPU frequency
 ```
-Results go to `bench-results/run-<timestamp>.json|csv`, with one row per run plus a median row per scenario. The median row is the real median run (by conversion time), picked only from runs that verified, ran in a visible tab and didn't overlap another job.
+The results are written to a Markdown report in the folder you ran the command from: `bench-report-<mac|linux|win>-<time>.md` (`matrix-report-…` for `--matrix`; `--report <file.md>` picks another path). The terminal only shows one line per run. The report has the setup (OS, CPU, RAM, browser, power and thermal state), the median run per scenario (speed, main thread, CPU/GPU), skipped and failed scenarios, every run, what each column means, and the machine checks when started through `bench:mac/linux/win`. These report files are git-ignored.
+Raw data goes to `bench-results/run-<timestamp>.json|csv`, with one row per run plus a median row per scenario. The median row is the real median run (by conversion time), picked only from runs that verified, ran in a visible tab and didn't overlap another job.
 Scenarios are defined in `bench/scenarios.mjs`. Real media files can go in `bench/fixtures/`, referenced as `fixture: 'file:<name>'`.
 
 ### What is measured

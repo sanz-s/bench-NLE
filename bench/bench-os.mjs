@@ -360,10 +360,11 @@ async function main() {
   else if (own.has('--no-server')) serverUrl = 'http://127.0.0.1:9' // nothing listens there: no CPU/GPU is recorded
   if (!externalServer && serverUrl !== 'http://127.0.0.1:5199') runArgs.push('--server', serverUrl)
   log(`running: node bench/run.mjs ${runArgs.slice(1).join(' ')}`)
-  const code = await runNode(runArgs, 'bench/run.mjs', { ...process.env, BENCH_SERVER: serverUrl })
+  // the machine checks go into run.mjs's Markdown report
+  const code = await runNode(runArgs, 'bench/run.mjs', { ...process.env, BENCH_SERVER: serverUrl, BENCH_MACHINE_CHECKS: JSON.stringify(checks) })
   stopServer()
-  log(code === 0 ? 'benchmark finished: all runs verified' : `benchmark finished with failures (exit ${code}); see the summary above`)
-  log(`results: the run-*.json|csv named in the "wrote" line above${useServer ? `; per-job records with CPU/GPU charts open in the dashboard (start it with npm run bench:server, then ${SERVER_URL}/)` : ''}`)
+  log(code === 0 ? 'benchmark finished: all runs verified' : `benchmark finished with failures (exit ${code}); see the report`)
+  log(`results: the .md report named in the "results written to" line above (raw data in the run-*.json|csv)${useServer ? `; per-job records with CPU/GPU charts open in the dashboard (start it with npm run bench:server, then ${SERVER_URL}/)` : ''}`)
   process.exitCode = code
 }
 

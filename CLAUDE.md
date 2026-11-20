@@ -29,6 +29,7 @@ A browser-based non-linear video editor (NLE) whose purpose is **benchmarking Me
   - `--trace` saves Chrome traces.
   - `--headless` / `--chromium` choose a different browser setup.
   - `--aac auto|native|wasm` picks the AAC encoder under test (default auto). Each row records `audioEncoderImpl`.
+  - **Results:** no console tables (they wrapped and misaligned). `bench/report-md.mjs` writes a padded Markdown report to the folder npm was run from (`INIT_CWD`): `bench-report-<mac|linux|win>-<time>.md`, or `matrix-report-…` for `--matrix`; `--report <file.md>` overrides. Setup, median-run speed and load tables, skipped/failed scenarios, every run, a column legend, and `bench-os` machine checks (passed in `BENCH_MACHINE_CHECKS`). Git-ignored. Raw JSON/CSV still go to `--out`.
   - `--warmup N` (default 1) adds unrecorded warm-up runs per scenario.
   - `--cooldown S` (default 3) pauses between runs; with the bench-server up, it also waits ≤ 20 s for system CPU < `--idle-cpu` (25 %).
   - Capabilities are checked at each scenario's own output size, so an unsupported 4K encode is skipped, not failed.
@@ -43,7 +44,7 @@ A browser-based non-linear video editor (NLE) whose purpose is **benchmarking Me
 - `npm run test:regress`: regression tests for the defects found by the 2026-11-18 audits. Each test failed on the unfixed code, except guard tests that are marked as such.
   - `bench/regress.mjs`: export and measurement. Fractional audio tails, copy ignoring audio settings, verifier false positives and the copy heuristic (R1), AAC choice, tab visibility, failed-write cleanup (F4).
   - `bench/editor-regress.mjs`: 33 editor/render tests (E1–E20, F5–F7, F10, job queue). Flags: `--dist <dir> --port <n> --only <substr> --headed`. It uses `window.__nleBench.editor`, which exposes the store, model, compositor and other modules to tests.
-  - `bench/summary.test.mjs`: median and acceptance logic.
+  - `bench/summary.test.mjs`: median and acceptance logic, plus the Markdown report builder.
 - `npm run test:ui`: UI smoke tests through the real UI. `bench/ui-smoke.mjs` covers editing; `bench/effects-smoke.mjs` covers text, stickers, filters, transitions, copy/paste and effects exports. Screenshots go to `bench-results/ui-smoke/` and `bench-results/effects-smoke/`.
 - `node bench/showcase.mjs [--files a b c] [--export] [--no-sfx] [--test]`: opens headed Chrome on the running dev server (or starts one), imports 3 videos (or waits for you to), builds the all-tools showcase edit (`buildShowcase` in `harness.js`) and leaves the window open. It also imports the synthesized SFX kit from `bench/sfx/` (`node bench/make-sfx.mjs` regenerates it); any asset named `sfx-<name>.wav` is placed on A2+. Export only with `--export`.
 - `npx playwright install chromium` is needed only for `--chromium`. The default uses the installed Chrome.

@@ -29,3 +29,7 @@ bench/fixtures/*
 
 # compiled on first bench-server start
 bench-server/native/procstat
+
+# Markdown reports from npm run bench / bench:mac / bench:linux / bench:win (written where npm was run)
+bench-report-*.md
+matrix-report-*.md

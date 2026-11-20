@@ -14,6 +14,8 @@
  *          --aac auto|native|wasm (AAC encoder under test; auto = the browser's own when it has one; recorded per run)
  *          --warmup N (default 1: unrecorded warm-up runs per scenario)  --cooldown S (default 3 s between runs, plus
  *          waiting for system CPU < --idle-cpu % when the bench-server is up)
+ *          --report <file.md> (where the Markdown report goes; default bench-report-<os>-<time>.md, or
+ *          matrix-report-<os>-<time>.md, in the folder npm was run from)
  * Medians use only runs that finished AND passed output verification. Exit code is 1 if any run failed.
  *
  * What it records per run (merged into one row):
@@ -26,10 +28,12 @@
 import { chromium } from 'playwright'
 import { spawn } from 'node:child_process'
 import { existsSync, mkdirSync, writeFileSync } from 'node:fs'
+import os from 'node:os'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { FIXTURES, SCENARIOS } from './scenarios.mjs'
 import { exitCode, summarizeScenario } from './summary.mjs'
+import { markdownReport } from './report-md.mjs'
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..')
 const argv = process.argv.slice(2)
@@ -58,6 +62,10 @@ const FULL_VERIFY = has('full-verify') || (MATRIX && !has('quick-verify'))
 const SERVER = val('server', 'http://127.0.0.1:5199')
 // AAC encoder under test: auto (native when the browser has it) | native (WebCodecs) | wasm (@mediabunny/aac-encoder)
 const AAC = val('aac', 'auto')
+// the folder the user ran npm from (npm itself switches to the package root)
+const CALLER_DIR = process.env.INIT_CWD || process.cwd()
+const OS_NAME = { darwin: 'mac', linux: 'linux', win32: 'win' }[process.platform] ?? process.platform
+const OS_LABEL = { darwin: 'macOS', linux: 'Linux', win32: 'Windows' }[process.platform] ?? process.platform
 if (!['auto', 'native', 'wasm'].includes(AAC)) throw new Error(`--aac must be auto, native or wasm (got ${AAC})`)
 
 const log = (...a) => console.log('[bench]', ...a)
@@ -95,6 +103,12 @@ async function ensureApp() {
 }
 
 // ------------------------------------------------------------------ helpers
+/** `file` relative to `dir` when it is inside it, else absolute (no ../../.. chains). */
+function shortPath(file, dir) {
+  const rel = path.relative(dir, file)
+  return rel && !rel.startsWith('..') && !path.isAbsolute(rel) ? rel : file
+}
+
 function csv(rows) {
   const cols = [...new Set(rows.flatMap((r) => Object.keys(r)))]
   const esc = (v) => (v === null || v === undefined ? '' : /[",\n]/.test(String(v)) ? `"${String(v).replace(/"/g, '""')}"` : String(v))
@@ -278,8 +292,9 @@ async function main() {
       allReports.push(report)
       rows.push(row)
       summary.push({ combo: k, status: report.status, verified: report.verify?.ok ?? null, ms: Math.round(report.derived.conversionMs), problem: report.error ?? report.verify?.problems?.[0] ?? '' })
+      const last = summary.at(-1)
+      log(`${k}: ${last.status}${last.verified === true ? ', verified' : last.verified === false ? ', NOT verified' : ''} · ${last.ms} ms${last.problem ? ` · ${last.problem}` : ''}`)
     }
-    console.table(summary)
   } else {
     const list = SCENARIOS.filter((s) => !ONLY || ONLY.includes(s.id))
     if (!list.length) throw new Error(`no scenario matches ${ONLY}. Available: ${SCENARIOS.map((s) => s.id).join(', ')}`)
@@ -290,7 +305,7 @@ async function main() {
       const why = supported(scCaps, sc.settings)
       if (why) {
         log(`skip ${sc.id}: ${why}`)
-        summary.push({ scenario: sc.id, status: `skipped (${why})` })
+        summary.push({ scenario: sc.id, status: `skipped (${why})`, skipped: true, reason: why })
         continue
       }
       const scRows = []
@@ -316,34 +331,56 @@ async function main() {
       if (sum.median) {
         const m = sum.median
         rows.push(m)
-        summary.push({
-          scenario: sc.id,
-          'passed/runs': `${sum.passed}/${sum.runs}`,
-          'median run': m.medianOfRun,
-          runIn: m.runIn,
-          audioEnc: m.audioEncoderImpl,
-          convMs: m.conversionMs,
-          encWaitMs: m.encodeWaitMs,
-          'x realtime': m.realtimeX,
-          pipeFps: m.pipelineFps,
-          tbtMs: m.mtTbtMs,
-          longestMs: m.mtLongestMs,
-          cdpMainMs: m.cdp_mainTaskMs,
-          'cpu%': m.sysCpuAvg,
-          'browser%': m.browserCpuAvg,
-          'gpu%': m.gpuAvg,
-          MB: m.outBytes ? +(m.outBytes / 1048576).toFixed(2) : null,
-          verified: m.verified,
-        })
-      } else summary.push({ scenario: sc.id, 'passed/runs': `0/${sum.runs}`, status: 'FAILED', error: sum.firstFailure })
+        summary.push({ scenario: sc.id, status: sum.failed ? 'some runs failed' : 'passed', passedRuns: `${sum.passed}/${sum.runs}`, medianOfRun: m.medianOfRun, median: m })
+      } else summary.push({ scenario: sc.id, status: 'FAILED', failedAll: true, passedRuns: `0/${sum.runs}`, error: sum.firstFailure })
     }
-    console.table(summary)
   }
 
   const base = path.join(OUT, `${MATRIX ? 'matrix' : 'run'}-${stamp}`)
   writeFileSync(`${base}.json`, JSON.stringify({ createdAt: new Date().toISOString(), browser: browser.version(), headless: HEADLESS, isolated, serverOk, runs: RUNS, summary, reports: allReports }, null, 2))
   writeFileSync(`${base}.csv`, csv(rows))
-  log(`wrote ${path.relative(root, base)}.json and .csv${TRACE ? ` (+ traces in ${path.relative(root, OUT)}/traces)` : ''}`)
+  log(`wrote ${shortPath(base, root)}.json and .csv${TRACE ? ` (+ traces in ${shortPath(OUT, root)}/traces)` : ''}`)
+
+  // the results go to a Markdown file, not a console table (wide tables wrap and misalign in a terminal)
+  const firstReport = allReports.find((r) => !r.warmup) ?? allReports[0]
+  const cond = firstReport?.system?.conditions
+  const env = {
+    Date: new Date().toISOString().replace('T', ' ').slice(0, 19) + ' UTC',
+    OS: `${OS_LABEL} ${os.release()} (${os.arch()})`,
+    CPU: `${os.cpus()[0]?.model?.trim() ?? 'unknown'} × ${os.cpus().length} threads`,
+    RAM: `${Math.round(os.totalmem() / 1073741824)} GB`,
+    Node: process.version,
+    Browser: `${BUNDLED ? 'Playwright Chromium' : 'Google Chrome'} ${browser.version()}${HEADLESS ? ' (headless: GPU numbers may be software)' : ' (headed)'}`,
+    'Cross-origin isolated': isolated,
+    'Bench-server (CPU/GPU)': serverOk ? `online at ${SERVER}` : 'offline: CPU/GPU columns are empty',
+    'Power source': cond ? [cond.powerSource, cond.batteryPct != null ? `${cond.batteryPct}%` : null, cond.lowPowerMode ? 'Low Power Mode ON' : null].filter(Boolean).join(', ') || null : null,
+    Thermal: cond ? [cond.thermalWarning != null && cond.thermalWarning !== 'none' && `thermal warning level ${cond.thermalWarning}`, cond.performanceWarning != null && cond.performanceWarning !== 'none' && `performance warning level ${cond.performanceWarning}`, cond.cpuSpeedLimitPct != null && cond.cpuSpeedLimitPct < 100 && `CPU limited to ${cond.cpuSpeedLimitPct}%`, cond.maxTempC != null && `max ${Math.round(cond.maxTempC)} °C`].filter(Boolean).join(', ') || 'no warnings' : null,
+    ...(MATRIX ? {} : { 'Runs per scenario': `${RUNS} (+ ${WARMUP} warm-up, not counted)`, 'Cool-down': `${COOLDOWN_S} s${serverOk ? `, then wait for CPU < ${IDLE_CPU_PCT}%` : ''}` }),
+    'AAC encoder': AAC,
+    'Output check': FULL_VERIFY ? 'full decode (every frame and sample)' : 'first frames + last frame + audio tail',
+  }
+  let checks = []
+  try {
+    checks = JSON.parse(process.env.BENCH_MACHINE_CHECKS || '[]')
+  } catch {
+    /* not from bench-os */
+  }
+  const reportFile = path.resolve(CALLER_DIR, val('report', `${MATRIX ? 'matrix' : 'bench'}-report-${OS_NAME}-${stamp}.md`))
+  mkdirSync(path.dirname(reportFile), { recursive: true })
+  writeFileSync(
+    reportFile,
+    markdownReport({
+      title: `${MATRIX ? 'Format matrix' : 'Benchmark'} report: ${OS_LABEL}`,
+      env,
+      mode: MATRIX ? 'matrix' : 'scenarios',
+      summary,
+      rows,
+      checks,
+      command: `node bench/run.mjs ${argv.join(' ')}`.trim(),
+      files: [`${base}.json`, `${base}.csv`].map((f) => shortPath(f, path.dirname(reportFile))),
+    }),
+  )
+  log(`results written to ${reportFile}`)
 
   await browser.close()
   await server.close()
@@ -353,7 +390,7 @@ async function main() {
   const runRows = rows.filter((r) => r.run !== 'median')
   const skipped = summary.filter((x) => String(x.status ?? '').startsWith('skipped')).length
   const failedRuns = runRows.filter((r) => !(r.status === 'done' && r.verified === true))
-  if (skipped) log(`${skipped} scenario(s) skipped (not supported here); listed above`)
+  if (skipped) log(`${skipped} scenario(s) skipped (not supported here); listed in the report`)
   if (failedRuns.length) log(`FAILED: ${failedRuns.length}/${runRows.length} run(s) errored or failed output verification`)
   process.exitCode = exitCode(runRows, { skipped, failOnSkip: has('fail-on-skip') })
 }
