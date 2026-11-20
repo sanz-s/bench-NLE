@@ -176,5 +176,6 @@ The `JobReport` shape built in `src/bench/metrics.js` (`deriveMetrics`) and `job
 - Always `close()` `VideoSample`/`AudioSample` objects. CanvasSink canvases come from a pool, so draw them immediately.
 - MP4/MOV use `fastStart: 'in-memory'` only with `BufferTarget`. Streaming to disk (`StreamTarget` + `showSaveFilePicker`, Chromium only) uses `fastStart: false`.
 - HLS output writes many files, so it's greyed out in the UI.
+- Every local socket binds to `127.0.0.1`, never the name `localhost`: vite preview, the bench-server, and Playwright's `launchServer` control socket (`host: '127.0.0.1'` in `bench/run.mjs`). Playwright's default is the name `localhost`, which fails with `EADDRNOTAVAIL` ("address not available", Chrome never launches) on machines where localhost resolves to an address that isn't up, e.g. `::1` with IPv6 disabled.
 - Real GPU and hardware-encoder numbers need **headed** Chrome. Headless may fall back to software.
 - The code is plain JavaScript (converted from TypeScript). Source files are `.js`/`.jsx`, imports stay extensionless, and the worker is loaded as `new URL('../workers/media.worker.js', import.meta.url)`. `jsconfig.json` exists only for editor IntelliSense. There are no type annotations, so use JSDoc comments for anything worth documenting.

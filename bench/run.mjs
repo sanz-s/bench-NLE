@@ -169,6 +169,10 @@ async function main() {
   log(serverOk ? `bench-server online at ${SERVER}: CPU/GPU will be recorded` : 'bench-server offline: CPU/GPU columns will be empty (start it with `npm run bench:server`)')
 
   const launchOpts = {
+    // Playwright's control socket. Without a host it listens on the NAME "localhost", which fails with
+    // EADDRNOTAVAIL ("address not available") where localhost resolves to an address that isn't up (e.g. ::1 with
+    // IPv6 disabled). The IPv4 loopback is always there, and it's what vite preview and the bench-server use too.
+    host: '127.0.0.1',
     headless: HEADLESS,
     args: ['--enable-precise-memory-info', '--autoplay-policy=no-user-gesture-required', '--disable-background-timer-throttling', '--disable-renderer-backgrounding'],
   }
@@ -177,7 +181,7 @@ async function main() {
   try {
     server = await chromium.launchServer(launchOpts)
   } catch (err) {
-    if (BUNDLED) throw err
+    if (BUNDLED || /EADDR|listen/i.test(err.message)) throw err // a socket problem: another browser won't help
     log(`could not launch installed Chrome (${err.message.split('\n')[0]}); falling back to bundled Chromium`)
     delete launchOpts.channel
     server = await chromium.launchServer(launchOpts)
