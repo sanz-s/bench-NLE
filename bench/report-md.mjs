@@ -54,6 +54,7 @@ const LOAD_COLS = [
   { key: 'sysCpuAvg', title: 'CPU %', num: true },
   { key: 'browserCpuAvg', title: 'Browser CPU %', num: true },
   { key: 'gpuAvg', title: 'GPU %', num: true },
+  { key: 'gpuBrowserAvg', title: 'Browser GPU %', num: true },
   { key: 'cpuPowerAvgW', title: 'CPU W', num: true },
   { key: 'gpuPowerAvgW', title: 'GPU W', num: true },
   { key: 'browserRssMaxMB', title: 'Browser RSS MB', num: true },
@@ -95,7 +96,8 @@ const LEGEND = [
   ['Frames > 50 ms', 'animation frames that took longer than 50 ms (visible UI jank)'],
   ['CPU %', 'whole-machine CPU, time-weighted average over the job (needs the bench-server)'],
   ['Browser CPU %', 'CPU of the benchmark browser’s processes (100 = one full core)'],
-  ['GPU %', 'GPU device utilisation (whole machine)'],
+  ['GPU %', 'GPU utilisation of the whole machine (busiest engine); the Setup table’s GPU source row says where it comes from, or why it is missing'],
+  ['Browser GPU %', 'the benchmark browser’s own GPU share: Windows per-process GPU counters, Linux DRM fdinfo. macOS doesn’t expose it'],
   ['CPU W / GPU W', 'average power; only with --power (sudo)'],
   ['—', 'not measured. TBT and longest task need the Long Tasks API and Main-thread ms needs CDP: both Chromium only. Frames > 50 ms works in every engine, so use it to compare main-thread jank across engines'],
 ]

@@ -244,6 +244,94 @@ export function summarizeGpuProcessMemory(samples, pids) {
   return { dedicatedMB: dedicated / 1048576, sharedMB: shared / 1048576 }
 }
 
+// ------------------------------------------------------------------ Linux DRM fdinfo (per-client GPU engine time)
+
+/**
+ * One `/proc/<pid>/fdinfo/<fd>` of a DRM device → { driver, pdev, clientId, engines } or null when it isn't a DRM
+ * client with usage stats (kernel "DRM client usage stats": i915 ≥ 5.19, amdgpu ≥ 5.14, xe, msm, panfrost, v3d …).
+ * Engines: `drm-engine-<name>: N ns` (busy time) or, on Intel xe, `drm-cycles-<name>` against
+ * `drm-total-cycles-<name>` (busy vs elapsed GPU cycles); `drm-engine-capacity-<name>` = engines of that class.
+ */
+export function parseDrmFdinfo(text) {
+  const kv = {}
+  for (const line of String(text ?? '').split('\n')) {
+    const m = /^(drm-[\w.-]+):\s*(.+?)\s*$/.exec(line)
+    if (m) kv[m[1]] = m[2]
+  }
+  if (!kv['drm-driver'] || kv['drm-client-id'] === undefined) return null
+  const engines = {}
+  const eng = (name) => (engines[name] ??= { ns: null, cycles: null, totalCycles: null, capacity: 1 })
+  for (const [k, v] of Object.entries(kv)) {
+    let m
+    if ((m = /^drm-engine-capacity-(.+)$/.exec(k))) eng(m[1]).capacity = Math.max(1, Number(v) || 1)
+    else if ((m = /^drm-engine-(.+)$/.exec(k)) && /\bns$/.test(v)) eng(m[1]).ns = Number(v.split(/\s+/)[0])
+    else if ((m = /^drm-total-cycles-(.+)$/.exec(k))) eng(m[1]).totalCycles = Number(v)
+    else if ((m = /^drm-cycles-(.+)$/.exec(k))) eng(m[1]).cycles = Number(v)
+  }
+  for (const [k, e] of Object.entries(engines)) if (e.ns === null && e.cycles === null) delete engines[k]
+  if (!Object.keys(engines).length) return null
+  return { driver: kv['drm-driver'], pdev: kv['drm-pdev'] ?? '', clientId: kv['drm-client-id'], engines }
+}
+
+/** Engine names across drivers → renderer (3D) / video (encode + decode) groups. */
+const DRM_RENDER = /^(?:render|gfx|rcs|3d|fragment|vertex-tiler|gpu)$/i
+const DRM_VIDEO = /^(?:video|video-enhance|enc|dec|enc_\d+|dec_\d+|vcs|vecs|vcn|jpeg)$/i
+
+/**
+ * Two fdinfo snapshots → GPU utilisation per engine, for all clients and per client.
+ * `prev`/`cur`: Map "<pdev>|<client-id>" → { pids: Set, engines } (one client can be open in several fds and
+ * forked processes: keyed once, so it isn't counted twice). `dtNs` = wall time between the snapshots.
+ * Returns { byEngine, device, renderer, video, clients: Map key → { pids, byEngine } } (percent, capped at 100).
+ */
+export function drmUtilization(prev, cur, dtNs) {
+  const byEngine = {}
+  const clients = new Map()
+  for (const [key, c] of cur) {
+    const p = prev?.get(key)
+    if (!p) continue // a client needs two readings
+    const mine = {}
+    for (const [name, e] of Object.entries(c.engines)) {
+      const q = p.engines[name]
+      if (!q) continue
+      let pct = null
+      if (e.ns !== null && q.ns !== null && dtNs > 0) pct = ((e.ns - q.ns) / dtNs / e.capacity) * 100
+      else if (e.cycles !== null && q.cycles !== null && e.totalCycles !== null && q.totalCycles !== null && e.totalCycles > q.totalCycles)
+        pct = ((e.cycles - q.cycles) / (e.totalCycles - q.totalCycles) / e.capacity) * 100
+      if (pct === null || !Number.isFinite(pct) || pct < 0) continue
+      mine[name] = Math.min(100, pct)
+      byEngine[name] = Math.min(100, (byEngine[name] ?? 0) + mine[name])
+    }
+    clients.set(key, { pids: c.pids, byEngine: mine })
+  }
+  return { ...drmGroups(byEngine), clients }
+}
+
+function drmGroups(byEngine) {
+  const vals = Object.values(byEngine)
+  const max = (re) => {
+    const v = Object.entries(byEngine).filter(([k]) => re.test(k)).map(([, x]) => x)
+    return v.length ? Math.max(...v) : null
+  }
+  return { byEngine, device: vals.length ? Math.max(...vals) : null, renderer: max(DRM_RENDER), video: max(DRM_VIDEO) }
+}
+
+/** The same utilisation restricted to clients opened by any of `pids` (the benchmark browser's processes). */
+export function drmUtilizationFor(util, pids) {
+  if (!util || !pids) return null
+  const byEngine = {}
+  for (const c of util.clients.values()) {
+    if (![...c.pids].some((p) => pids.has(p))) continue
+    for (const [k, v] of Object.entries(c.byEngine)) byEngine[k] = Math.min(100, (byEngine[k] ?? 0) + v)
+  }
+  return drmGroups(byEngine)
+}
+
+/** Intel RC6 / gt-idle residency (ms idle) → whole-GPU busy % between two readings (null if it went backwards). */
+export function rc6BusyPct(prevMs, curMs, dtMs) {
+  if (prevMs === null || curMs === null || !(dtMs > 0) || curMs < prevMs) return null
+  return Math.max(0, Math.min(100, (1 - (curMs - prevMs) / dtMs) * 100))
+}
+
 // ------------------------------------------------------------------ attribution (which process owns a socket)
 
 /**

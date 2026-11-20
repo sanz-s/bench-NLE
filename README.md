@@ -8,7 +8,7 @@ export benchmarking: conversion time, encode time, main-thread blocking, and CPU
 ```bash
 npm install
 npx playwright install --with-deps   # browsers for the benchmarks: Chromium, Firefox, WebKit (+ system libraries on Linux, via sudo)
-npm run dev                 # http://localhost:5173  (the editor; works on its own)
+npm run dev                 # http://127.0.0.1:5173  (the editor; works on its own)
 npm run bench:server        # optional, in a 2nd terminal: CPU/GPU sampler → "Metrics on" in the top bar
 ```
 ## Export Monitor (dashboard)

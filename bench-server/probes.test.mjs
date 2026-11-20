@@ -258,3 +258,75 @@ test('powermetrics tasks rows (real M3 Pro format; names cut to 32 chars and con
   assert.equal(P.parsePowermetricsTaskRow('ALL_TASKS                          -2     1509.09   54.24  659.98  143.89             2294.59 111.28            0.00      ').pid, -2)
   assert.equal(P.parsePowermetricsTaskRow('**** Processor usage ****'), null)
 })
+
+// ------------------------------------------------------------------ Linux DRM fdinfo
+const I915 = `pos:	0
+flags:	02100002
+mnt_id:	26
+drm-driver:	i915
+drm-client-id:	7
+drm-pdev:	0000:00:02.0
+drm-engine-render:	1000000000 ns
+drm-engine-copy:	0 ns
+drm-engine-video:	500000000 ns
+drm-engine-capacity-video:	2
+drm-engine-video-enhance:	0 ns
+`
+const XE = `drm-driver:	xe
+drm-client-id:	12
+drm-pdev:	0000:00:02.0
+drm-cycles-rcs:	1000
+drm-total-cycles-rcs:	10000
+drm-cycles-vcs:	0
+drm-total-cycles-vcs:	10000
+drm-engine-capacity-vcs:	2
+`
+const AMD = `drm-driver:	amdgpu
+drm-pdev:	0000:03:00.0
+drm-client-id:	55
+drm-engine-gfx:	200000000 ns
+drm-engine-enc:	0 ns
+drm-memory-vram:	1024 KiB
+`
+
+test('DRM fdinfo: i915 / amdgpu busy-ns and xe cycles parse; non-DRM fds are ignored', () => {
+  const i = P.parseDrmFdinfo(I915)
+  assert.equal(i.driver, 'i915')
+  assert.equal(i.clientId, '7')
+  assert.equal(i.engines.render.ns, 1e9)
+  assert.equal(i.engines.video.capacity, 2)
+  const x = P.parseDrmFdinfo(XE)
+  assert.equal(x.engines.rcs.cycles, 1000)
+  assert.equal(x.engines.rcs.totalCycles, 10000)
+  assert.equal(P.parseDrmFdinfo(AMD).engines.gfx.ns, 2e8)
+  assert.equal(P.parseDrmFdinfo('pos:\t0\nflags:\t02\n'), null)
+})
+
+test('DRM utilisation: Δbusy / Δtime per engine, divided by capacity; a client in two pids counts once', () => {
+  const snap = (text, pids, bump = {}) => {
+    const c = P.parseDrmFdinfo(text)
+    for (const [k, v] of Object.entries(bump)) Object.assign(c.engines[k], v)
+    return new Map([[`${c.pdev}|${c.clientId}`, { pids: new Set(pids), engines: c.engines }]])
+  }
+  // i915: render +250 ms and video +500 ms (2 engines) over 1 s → render 25 %, video 25 %
+  const a = snap(I915, [100])
+  const b = snap(I915, [100, 101], { render: { ns: 1.25e9 }, video: { ns: 1e9 } })
+  const u = P.drmUtilization(a, b, 1e9)
+  assert.equal(Math.round(u.byEngine.render), 25)
+  assert.equal(Math.round(u.byEngine.video), 25)
+  assert.equal(Math.round(u.renderer), 25)
+  assert.equal(Math.round(P.drmUtilizationFor(u, new Set([101])).device), 25)
+  assert.equal(P.drmUtilizationFor(u, new Set([999])).device, null)
+  // xe: rcs +3000 of +10000 cycles → 30 %
+  const xa = snap(XE, [200])
+  const xb = snap(XE, [200], { rcs: { cycles: 4000, totalCycles: 20000 } })
+  assert.equal(Math.round(P.drmUtilization(xa, xb, 1e9).renderer), 30)
+  // a client seen only once has no utilisation yet
+  assert.equal(P.drmUtilization(new Map(), b, 1e9).device, null)
+})
+
+test('Intel RC6 residency → busy %', () => {
+  assert.equal(P.rc6BusyPct(1000, 1400, 1000), 60)
+  assert.equal(P.rc6BusyPct(null, 1400, 1000), null)
+  assert.equal(P.rc6BusyPct(1400, 1000, 1000), null)
+})

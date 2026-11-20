@@ -4,8 +4,8 @@
  * edit that uses almost every tool (8 cuts, 9 transitions, 20+ video effects, filters, PiP, stickers,
  * animated titles with text effects, adjustment layers, linked audio) and plays it (export only with --export). The browser stays open until you close it.
  *
- *   node bench/showcase.mjs                 # uses your running `npm run dev` (localhost:5173), else starts one
- *   node bench/showcase.mjs --url http://localhost:5173
+ *   node bench/showcase.mjs                 # uses your running `npm run dev` (127.0.0.1:5173), else starts one
+ *   node bench/showcase.mjs --url http://127.0.0.1:5173
  *   node bench/showcase.mjs --test          # self-test: generates 3 clips instead of waiting, headless, exits
  *   node bench/showcase.mjs --export        # also export the MP4 to bench-results/showcase/ (off by default)
  *   node bench/showcase.mjs --files a.mp4 b.mov c.mp4   # import these instead of waiting for you
@@ -49,7 +49,8 @@ const up = async (u) => {
 let url = arg('--url')
 let server = null
 if (!url) {
-  for (const u of ['http://localhost:5173', 'http://[::1]:5173', 'http://127.0.0.1:5173']) {
+  // loopback addresses only: the name localhost can resolve elsewhere on a misconfigured machine
+  for (const u of ['http://127.0.0.1:5173', 'http://[::1]:5173']) {
     if (await up(u)) {
       url = u
       break
@@ -63,7 +64,7 @@ if (!url) {
   url = `http://127.0.0.1:${port}`
   for (let i = 0; i < 100 && !(await up(url)); i++) await new Promise((r) => setTimeout(r, 200))
 }
-url = url.replace('[::1]', 'localhost')
+url = url.replace('[::1]', '127.0.0.1')
 log(`editor: ${url}`)
 
 const browser = await chromium.launch({ channel: 'chrome', headless: test, args: ['--start-maximized'] })

@@ -65,8 +65,11 @@ function benchApiBridge() {
 
 export default defineConfig({
   plugins: [react(), isolationOnEveryResponse(), benchApiBridge()],
-  server: { port: 5173, headers: isolationHeaders },
-  preview: { port: 4173, headers: isolationHeaders },
+  // Listen on the IPv4 loopback, not the NAME "localhost": on machines where localhost resolves to something else
+  // (seen: an /etc/hosts or DNS entry pointing it at a public address) Vite fails with EADDRNOTAVAIL.
+  // `npm run dev -- --host` still opens it to the network when you want that.
+  server: { host: '127.0.0.1', port: 5173, headers: isolationHeaders },
+  preview: { host: '127.0.0.1', port: 4173, headers: isolationHeaders },
   worker: { format: 'es' },
   optimizeDeps: {
     // The extensions spawn their own inline workers / WASM; keep them out of pre-bundling.

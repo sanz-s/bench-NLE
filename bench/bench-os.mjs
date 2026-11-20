@@ -25,7 +25,8 @@
  * bench-results/exports.jsonl (shown in the dashboard at http://127.0.0.1:<bench-port>/).
  */
 import { spawn, spawnSync } from 'node:child_process'
-import { accessSync, constants, existsSync, readdirSync, readFileSync, statSync } from 'node:fs'
+import { accessSync, constants, existsSync, readdirSync, readFileSync, readlinkSync, statSync } from 'node:fs'
+import { lookup as dnsLookup } from 'node:dns/promises'
 import os from 'node:os'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -107,6 +108,16 @@ async function runChecks() {
   else if (own.has('--force')) warn('operating system', `this is ${NAMES[process.platform] ?? process.platform}, not ${NAMES[PLATFORM]} (--force)`)
   else bad('operating system', `this is ${NAMES[process.platform] ?? process.platform}; use npm run bench:${Object.keys(TARGETS).find((k) => TARGETS[k] === process.platform) ?? '<os>'}`)
 
+  // the name localhost must mean this machine (Vite, Playwright and browsers rely on it)
+  try {
+    const addrs = (await dnsLookup('localhost', { all: true })).map((a) => a.address)
+    const outside = addrs.filter((a) => !/^127\.|^::1$|^::ffff:127\./.test(a))
+    if (outside.length) warn('localhost', `resolves to ${outside.join(', ')}, not only this machine (127.0.0.1). The scripts use 127.0.0.1, but other tools may break: fix /etc/hosts (Windows: C:\\Windows\\System32\\drivers\\etc\\hosts) so it has "127.0.0.1 localhost"`)
+    else ok('localhost', addrs.join(', '))
+  } catch (e) {
+    warn('localhost', `could not resolve the name localhost (${e.code ?? e.message}); the scripts use 127.0.0.1`)
+  }
+
   // Node + dependencies
   const major = Number(process.versions.node.split('.')[0])
   if (major >= 18) ok('Node.js', process.versions.node)
@@ -170,9 +181,7 @@ function platformServerChecks() {
   } else if (process.platform === 'linux') {
     if (existsSync('/proc/self/stat')) ok('CPU / memory', '/proc (per process, PSS memory)')
     else bad('CPU / memory', '/proc missing')
-    if (onPath('nvidia-smi')) ok('GPU %', 'nvidia-smi (NVIDIA, incl. encoder/decoder %)')
-    else if (readdirSafe('/sys/class/drm').some((c) => existsSync(`/sys/class/drm/${c}/device/gpu_busy_percent`))) ok('GPU %', 'AMD gpu_busy_percent')
-    else warn('GPU %', 'no nvidia-smi or AMD gpu_busy_percent: no GPU numbers (Intel GPUs are not read)')
+    linuxGpuChecks()
     const rapl = '/sys/class/powercap/intel-rapl:0/energy_uj'
     if (!existsSync(rapl)) ok('CPU power', 'no RAPL on this machine')
     else if (canRead(rapl) || own.has('--power')) ok('CPU power', own.has('--power') ? 'RAPL via sudo' : 'RAPL readable')
@@ -181,9 +190,7 @@ function platformServerChecks() {
   } else if (process.platform === 'win32') {
     if (onPath('powershell.exe')) ok('PowerShell', 'found (process, GPU-engine and battery probes)')
     else bad('PowerShell', 'powershell.exe not on PATH: the bench-server needs it on Windows')
-    const ui = sh('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', '(Get-UICulture).Name'])
-    if (ui && !/^en/i.test(ui)) warn('GPU counters', `Windows display language is ${ui}: the \\GPU Engine counters are read by English name and may be missing`)
-    warn('Windows sampler', 'written but not yet verified on real Windows hardware: check the dashboard detail (method) after the first run')
+    windowsGpuCheck()
     if (own.has('--power')) warn('power', '--power has no effect on Windows (only NVIDIA power.draw is read)')
   }
   // the results file must be writable, or records stay in memory only
@@ -192,6 +199,63 @@ function platformServerChecks() {
     if (own.has('--power')) ok('results file', `${path.relative(root, records)} is not writable now; the sudo server hands it back to you`)
     else warn('results file', `${path.relative(root, records)} is not writable (an earlier sudo run?). Fix: sudo chown $(whoami) ${records}`)
   }
+}
+/** Linux: every GPU source the bench-server can read here (it uses the first whole-GPU one, and fdinfo per process). */
+function linuxGpuChecks() {
+  const cards = readdirSafe('/sys/class/drm').filter((c) => /^card\d+$/.test(c))
+  const drivers = cards.map((c) => path.basename(readlinkSafe(`/sys/class/drm/${c}/device/driver`) ?? '')).filter(Boolean)
+  const whole = []
+  if (onPath('nvidia-smi')) whole.push('nvidia-smi (NVIDIA, incl. encoder/decoder %)')
+  if (cards.some((c) => existsSync(`/sys/class/drm/${c}/device/gpu_busy_percent`))) whole.push('AMD gpu_busy_percent')
+  const rc6 = cards.some((c) => existsSync(`/sys/class/drm/${c}/power/rc6_residency_ms`) || readdirSafe(`/sys/class/drm/${c}/gt`).some((g) => existsSync(`/sys/class/drm/${c}/gt/${g}/rc6_residency_ms`)) || readdirSafe(`/sys/class/drm/${c}/device`).some((t) => /^tile\d+$/.test(t) && existsSync(`/sys/class/drm/${c}/device/${t}/gt0/gtidle/idle_residency_ms`)))
+  if (rc6) whole.push('Intel RC6 residency (whole GPU)')
+  const fd = drmFdinfoSample()
+  const fdinfo = fd ? `DRM fdinfo per process (${fd.driver}${fd.cycles ? ', cycles' : ''})` : null
+  const gpus = drivers.length ? `GPU driver${drivers.length > 1 ? 's' : ''}: ${[...new Set(drivers)].join(', ')}` : 'no /sys/class/drm GPU'
+  if (whole.length || fdinfo) ok('GPU %', `${[...whole, fdinfo].filter(Boolean).join(' + ')} · ${gpus}`)
+  else warn('GPU %', `nothing readable: no nvidia-smi, AMD gpu_busy_percent, Intel RC6 or DRM fdinfo usage stats (fdinfo needs kernel ≥ 5.19 for i915; this is ${os.release()}) · ${gpus}`)
+  if (!fdinfo && whole.length) warn('browser GPU %', `no DRM fdinfo usage stats (kernel ${os.release()}; ≥ 5.19 for i915): only whole-GPU numbers`)
+}
+const readlinkSafe = (p) => {
+  try {
+    return readlinkSync(p)
+  } catch {
+    return null
+  }
+}
+/** First DRM client with usage stats among your processes (bounded scan), or null. */
+function drmFdinfoSample() {
+  let budget = 4000
+  for (const pid of readdirSafe('/proc').filter((e) => /^\d+$/.test(e))) {
+    for (const fd of readdirSafe(`/proc/${pid}/fd`)) {
+      if (--budget < 0) return null
+      if (!(readlinkSafe(`/proc/${pid}/fd/${fd}`) ?? '').startsWith('/dev/dri/')) continue
+      let text = ''
+      try {
+        text = readFileSync(`/proc/${pid}/fdinfo/${fd}`, 'utf8')
+      } catch {
+        continue
+      }
+      const driver = /^drm-driver:\s*(\S+)/m.exec(text)?.[1]
+      if (driver && /^drm-(?:engine|cycles)-/m.test(text)) return { driver, cycles: /^drm-cycles-/m.test(text) }
+    }
+  }
+  return null
+}
+/** Windows: one reading through Get-Counter and one through CIM, with instance counts and timings. */
+function windowsGpuCheck() {
+  const script =
+    "$sw=[Diagnostics.Stopwatch]::StartNew(); $a=@((Get-Counter '\\GPU Engine(*)\\Utilization Percentage' -ErrorAction SilentlyContinue).CounterSamples).Count; $t1=$sw.ElapsedMilliseconds; $sw.Restart(); " +
+    "$b=@(Get-CimInstance Win32_PerfFormattedData_GPUPerformanceCounters_GPUEngine -ErrorAction SilentlyContinue).Count; $t2=$sw.ElapsedMilliseconds; \"$a $t1 $b $t2 $((Get-UICulture).Name)\""
+  // -EncodedCommand (UTF-16LE base64), like the server's loops: no command-line quoting to get wrong
+  const out = sh('powershell.exe', ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-EncodedCommand', Buffer.from(script, 'utf16le').toString('base64')], { timeout: 30000 })
+  const m = /(\d+) (\d+) (\d+) (\d+) (\S*)/.exec(out ?? '')
+  if (!m) return warn('GPU %', 'could not read the GPU counters through PowerShell (no output)')
+  const [counter, counterMs, cim, cimMs, ui] = [Number(m[1]), Number(m[2]), Number(m[3]), Number(m[4]), m[5]]
+  const detail = `Get-Counter: ${counter} GPU engine instances in ${counterMs} ms · CIM: ${cim} in ${cimMs} ms · display language ${ui || '?'}`
+  if (counter > 0) ok('GPU %', `${detail} (the server uses Get-Counter)`)
+  else if (cim > 0) ok('GPU %', `${detail} (Get-Counter gives nothing here, so the server switches to CIM)`)
+  else warn('GPU %', `${detail}: no GPU engine counters at all (needs a WDDM 2.x GPU driver; Remote Desktop and some VMs have none)`)
 }
 const readdirSafe = (d) => {
   try {

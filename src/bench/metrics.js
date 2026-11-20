@@ -85,6 +85,8 @@ export function flattenReport(r) {
     rendererCpuAvg: round(r.system?.browserCpuByType?.renderer?.avg, 1),
     gpuAvg: round(r.system?.gpuDevicePct?.avg, 1),
     gpuMax: round(r.system?.gpuDevicePct?.max, 1),
+    // the benchmark browser's own GPU share (Windows per-PID counters, Linux DRM fdinfo; macOS doesn't expose it)
+    gpuBrowserAvg: round(r.system?.gpuBrowserPct?.avg, 1),
     gpuPowerAvgW: round(r.system?.gpuPowerW?.avg, 2),
     cpuPowerAvgW: round(r.system?.cpuPowerW?.avg, 2),
     browserRssMaxMB: round(r.system?.browserRssMB?.max),

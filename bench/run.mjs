@@ -7,7 +7,7 @@
  *   npm run bench -- --runs 5 --trace               # 5 runs each, save Chrome traces
  *   npm run bench -- --matrix                       # round-trip each encodable codec (representative pairings)
  *   npm run bench -- --matrix-all                   # …every container × video × audio pairing
- *   npm run bench -- --url http://localhost:5173    # use an already running dev server
+ *   npm run bench -- --url http://127.0.0.1:5173    # use an already running dev server
  *   npm run bench -- --browsers chrome,firefox  # which browsers (default all = chrome, firefox, webkit: one per engine;
  *                                                 also edge, chromium). Firefox/WebKit: npx playwright install --with-deps
  *   flags: --headless  --chromium (= --browsers chromium)  --out bench-results
@@ -247,6 +247,9 @@ async function main() {
     Node: process.version,
     'Browser mode': HEADLESS ? 'headless (GPU numbers may be software)' : 'headed (real GPU and hardware encoders)',
     'Bench-server (CPU/GPU)': serverOk ? `online at ${SERVER}` : 'offline: CPU/GPU columns are empty',
+    // where the GPU numbers come from, or why there are none (from the bench-server's method notes)
+    'GPU source': serverOk ? (firstReport?.system?.method?.gpu ?? 'unknown (no job reached the bench-server)') : null,
+    'Browser GPU source': serverOk ? (firstReport?.system?.method?.processGpu ?? null) : null,
     'Power source': cond ? [cond.powerSource, cond.batteryPct != null ? `${cond.batteryPct}%` : null, cond.lowPowerMode ? 'Low Power Mode ON' : null].filter(Boolean).join(', ') || null : null,
     Thermal: cond ? [cond.thermalWarning != null && cond.thermalWarning !== 'none' && `thermal warning level ${cond.thermalWarning}`, cond.performanceWarning != null && cond.performanceWarning !== 'none' && `performance warning level ${cond.performanceWarning}`, cond.cpuSpeedLimitPct != null && cond.cpuSpeedLimitPct < 100 && `CPU limited to ${cond.cpuSpeedLimitPct}%`, cond.maxTempC != null && `max ${Math.round(cond.maxTempC)} °C`].filter(Boolean).join(', ') || 'no warnings' : null,
     ...(MATRIX ? {} : { 'Runs per scenario': `${RUNS} (+ ${WARMUP} warm-up, not counted)`, 'Cool-down': `${COOLDOWN_S} s${serverOk ? `, then wait for CPU < ${IDLE_CPU_PCT}%` : ''}` }),

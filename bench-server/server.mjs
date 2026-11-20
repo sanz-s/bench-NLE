@@ -171,8 +171,8 @@ function pruneCache(cache, procs) {
 }
 
 // Windows: two long-lived PowerShell loops (spawning one per sample would cost ~0.3 s CPU each time).
-// UNTESTED on real Windows: written from the documented Win32_Process / Get-Counter formats.
-const win = { procs: null, at: 0, gpu: null, gpuAt: 0, started: false, error: null }
+// Verified on a real Windows laptop for CPU/memory (2026-11-20); the GPU loop's CIM fallback is not verified yet.
+const win = { procs: null, at: 0, gpu: null, gpuAt: 0, gpuPeriod: null, gpuSrc: null, gpuMs: null, gpuErr: null, started: false, error: null }
 function startWindowsProbes() {
   if (win.started) return
   win.started = true
@@ -188,12 +188,32 @@ while($true){
   [Console]::Out.WriteLine((@{k='p';at=$sw.Elapsed.TotalMilliseconds;p=@($rows)}|ConvertTo-Json -Compress -Depth 3)); [Console]::Out.Flush()
   Start-Sleep -Milliseconds ${INTERVAL}
 }`
+  // GPU: one Get-Counter reading per loop (a -Continuous stream can stop for good when GPU-engine instances come and
+  // go, which they do whenever a process starts or exits). When Get-Counter gives nothing twice in a row (counter
+  // names are localised on non-English Windows, or PDH fails), switch to the CIM classes, which have the same data
+  // under language-independent names. Every line says which source ran, how long it took, and the last error.
   const gpuScript = `$ErrorActionPreference='SilentlyContinue'
 $paths='\\GPU Engine(*)\\Utilization Percentage','\\GPU Process Memory(*)\\Dedicated Usage','\\GPU Process Memory(*)\\Shared Usage'
-Get-Counter -Counter $paths -SampleInterval 1 -Continuous | ForEach-Object {
+$mode='counter'; $fails=0
+while($true){
   if(-not (Get-Process -Id ${process.pid} -ErrorAction SilentlyContinue)){ exit }
-  $s=foreach($x in $_.CounterSamples){ [pscustomobject]@{c=$x.Path.Split('\\')[-1];n=$x.InstanceName;v=[double]$x.CookedValue} }
-  [Console]::Out.WriteLine((@{k='g';s=@($s)}|ConvertTo-Json -Compress -Depth 3)); [Console]::Out.Flush()
+  $sw=[Diagnostics.Stopwatch]::StartNew(); $s=@(); $err=$null
+  if($mode -eq 'counter'){
+    $ev=$null
+    $r=Get-Counter -Counter $paths -ErrorAction SilentlyContinue -ErrorVariable ev
+    if($r){ $s=@(foreach($x in $r.CounterSamples){ [pscustomobject]@{c=$x.Path.Split('\\')[-1];n=$x.InstanceName;v=[double]$x.CookedValue} }) }
+    if($ev){ $err=[string]$ev[0] }
+    if($s.Count -eq 0){ $fails++; if($fails -ge 2){ $mode='cim' } } else { $fails=0 }
+  } else {
+    try {
+      $e=Get-CimInstance Win32_PerfFormattedData_GPUPerformanceCounters_GPUEngine -ErrorAction Stop
+      $m=Get-CimInstance Win32_PerfFormattedData_GPUPerformanceCounters_GPUProcessMemory -ErrorAction SilentlyContinue
+      $s=@(foreach($x in $e){ [pscustomobject]@{c='utilization percentage';n=$x.Name;v=[double]$x.UtilizationPercentage} })
+      $s+=@(foreach($x in $m){ [pscustomobject]@{c='dedicated usage';n=$x.Name;v=[double]$x.DedicatedUsage}; [pscustomobject]@{c='shared usage';n=$x.Name;v=[double]$x.SharedUsage} })
+    } catch { $err=$_.Exception.Message }
+    Start-Sleep -Milliseconds ${Math.max(500, INTERVAL)}
+  }
+  [Console]::Out.WriteLine((@{k='g';src=$mode;ms=$sw.ElapsedMilliseconds;err=$err;s=$s}|ConvertTo-Json -Compress -Depth 3)); [Console]::Out.Flush()
 }`
   const launch = (script) => {
     const enc = Buffer.from(script, 'utf16le').toString('base64')
@@ -214,8 +234,15 @@ Get-Counter -Counter $paths -SampleInterval 1 -Continuous | ForEach-Object {
             win.at = j.at
             win.procs = (j.p ?? []).map((r) => ({ pid: r.i, ppid: r.pp, exe: r.n, cmd: r.c ?? '', cpu: r.t / 1e7, rssKB: r.w / 1024, privateKB: r.v / 1024 }))
           } else if (j.k === 'g') {
-            win.gpu = (j.s ?? []).map((x) => ({ c: x.c, n: x.n, v: x.v }))
-            win.gpuAt = Date.now()
+            const now = Date.now()
+            // ConvertTo-Json writes a one-element array as an object
+            const list = Array.isArray(j.s) ? j.s : j.s ? [j.s] : []
+            win.gpuPeriod = win.gpuAt ? now - win.gpuAt : null
+            win.gpu = list.map((x) => ({ c: x.c, n: x.n, v: x.v }))
+            win.gpuAt = now
+            win.gpuSrc = j.src
+            win.gpuMs = j.ms
+            win.gpuErr = j.err || null
           }
         } catch {
           /* partial line */
@@ -503,7 +530,119 @@ async function refreshPss(selected) {
 
 // ------------------------------------------------------------------ GPU
 
+// ---- Linux: DRM client usage stats (/proc/<pid>/fdinfo) + Intel RC6 residency. Works for Intel (i915, xe), AMD and
+// most other DRM drivers, without root for your own processes: gives the browser's own GPU % and, without NVIDIA/AMD
+// sysfs, the GPU % of all processes you can read (a sudo server, e.g. --power, reads every process).
+const drm = { fds: new Map(), fullScanAt: 0, newScanAt: 0, scanning: false, prev: null, prevT: 0, util: null, drivers: new Set(), rc6Files: null, rc6Prev: null, rc6PrevT: 0, everClients: false }
+async function drmFdsOf(pid) {
+  const out = []
+  let list
+  try {
+    list = await fsp.readdir(`/proc/${pid}/fd`)
+  } catch {
+    return out // gone, or another user's process (no permission)
+  }
+  for (const fd of list) {
+    const l = await fsp.readlink(`/proc/${pid}/fd/${fd}`).catch(() => '')
+    if (l.startsWith('/dev/dri/')) out.push(fd)
+  }
+  return out
+}
+/** Which processes hold a DRM device open: new pids every 2 s, every pid every 30 s (cached between scans). */
+async function scanDrmFds() {
+  if (drm.scanning) return
+  const now = Date.now()
+  const full = now - drm.fullScanAt > 30000
+  if (!full && now - drm.newScanAt < 2000) return
+  drm.scanning = true
+  try {
+    const pids = (await fsp.readdir('/proc')).filter((e) => /^\d+$/.test(e)).map(Number)
+    const alive = new Set(pids)
+    for (const pid of drm.fds.keys()) if (!alive.has(pid)) drm.fds.delete(pid)
+    for (const pid of pids) {
+      if (pid === process.pid || (!full && drm.fds.has(pid))) continue
+      drm.fds.set(pid, await drmFdsOf(pid))
+    }
+    drm.newScanAt = now
+    if (full) drm.fullScanAt = now
+  } catch {
+    /* no /proc */
+  } finally {
+    drm.scanning = false
+  }
+}
+async function sampleDrm() {
+  void scanDrmFds()
+  const cur = new Map()
+  for (const [pid, fds] of drm.fds) {
+    for (const fd of fds) {
+      const text = await fsp.readFile(`/proc/${pid}/fdinfo/${fd}`, 'utf8').catch(() => null)
+      const c = text && P.parseDrmFdinfo(text)
+      if (!c) continue
+      drm.drivers.add(c.driver)
+      const key = `${c.pdev}|${c.clientId}`
+      const have = cur.get(key)
+      if (have) have.pids.add(pid)
+      else cur.set(key, { pids: new Set([pid]), engines: c.engines })
+    }
+  }
+  const t = process.hrtime.bigint()
+  if (cur.size) drm.everClients = true
+  drm.util = drm.prev ? P.drmUtilization(drm.prev, cur, Number(t - drm.prevT)) : null
+  drm.prev = cur
+  drm.prevT = t
+  return drm.util
+}
+/** Intel whole-GPU busy from RC6 / gt-idle residency (i915: gt/gt*\/rc6_residency_ms, xe: tile*\/gt*\/gtidle). */
+async function sampleRc6() {
+  if (drm.rc6Files === null) {
+    drm.rc6Files = []
+    try {
+      for (const c of await fsp.readdir('/sys/class/drm')) {
+        if (!/^card\d+$/.test(c)) continue
+        const base = `/sys/class/drm/${c}`
+        const cands = [`${base}/power/rc6_residency_ms`]
+        for (const gt of await fsp.readdir(`${base}/gt`).catch(() => [])) cands.push(`${base}/gt/${gt}/rc6_residency_ms`)
+        for (const tile of (await fsp.readdir(`${base}/device`).catch(() => [])).filter((x) => /^tile\d+$/.test(x)))
+          for (const gt of (await fsp.readdir(`${base}/device/${tile}`).catch(() => [])).filter((x) => /^gt\d+$/.test(x))) cands.push(`${base}/device/${tile}/${gt}/gtidle/idle_residency_ms`)
+        const found = cands.filter((f) => existsSync(f))
+        // render GT only (gt0): media GTs (gt1 on newer Intel) idle separately
+        if (found.length) drm.rc6Files.push(found.find((f) => /gt0/.test(f)) ?? found[0])
+      }
+    } catch {
+      /* no drm */
+    }
+  }
+  if (!drm.rc6Files.length) return null
+  const vals = await Promise.all(drm.rc6Files.map((f) => fsp.readFile(f, 'utf8').then(Number, () => null)))
+  const t = Date.now()
+  let busy = null
+  if (drm.rc6Prev) {
+    const each = vals.map((v, i) => P.rc6BusyPct(drm.rc6Prev[i], v, t - drm.rc6PrevT)).filter((x) => x !== null)
+    if (each.length) busy = Math.max(...each)
+  }
+  drm.rc6Prev = vals
+  drm.rc6PrevT = t
+  return busy
+}
+
 let gpuSource = null
+/** Why there is no GPU number (shown in each record's method.gpu and the report), filled in as probes fail. */
+function gpuNoneReason() {
+  if (PLATFORM === 'darwin') return 'ioreg returned no IOAccelerator GPU'
+  if (PLATFORM === 'win32') {
+    if (win.gpuErr && !win.gpu) return `Windows GPU counters failed: ${win.gpuErr}`
+    if (!win.gpu) return 'Windows GPU counter loop has not produced a reading yet'
+    if (!win.gpu.length) return `Windows returned 0 GPU Engine instances (${win.gpuSrc ?? '?'}): no WDDM 2.x GPU counters on this machine?`
+    return `Windows GPU readings are stale (last ${Math.round((Date.now() - win.gpuAt) / 1000)} s ago; one read takes ~${win.gpuMs ?? '?'} ms)`
+  }
+  if (PLATFORM === 'linux') {
+    const kernel = os.release()
+    if (drm.everClients) return 'DRM fdinfo clients found but no utilisation yet'
+    return `no NVIDIA (nvidia-smi), AMD gpu_busy_percent, Intel RC6 residency or DRM fdinfo engine counters readable (fdinfo usage stats need kernel ≥ 5.19 for Intel i915; this is ${kernel})`
+  }
+  return 'no GPU source for this OS'
+}
 let nvidiaOk = PLATFORM === 'darwin' ? false : null // null = not probed yet
 let amdCards = null
 async function sampleGpu(pids) {
@@ -518,11 +657,12 @@ async function sampleGpu(pids) {
     }
   }
   let g = null
-  if (PLATFORM === 'win32' && win.gpu && Date.now() - win.gpuAt < 5000) {
+  // a reading is fresh for 5 s, or 3 read periods on a machine where one read takes longer
+  if (PLATFORM === 'win32' && win.gpu?.length && Date.now() - win.gpuAt < Math.max(5000, 3 * (win.gpuPeriod ?? 0))) {
     g = P.summarizeGpuEngines(win.gpu, pids)
     const mem = P.summarizeGpuProcessMemory(win.gpu, pids ?? new Set())
     g.browserGpuMemMB = mem.dedicatedMB + mem.sharedMB
-    gpuSource = 'Windows GPU Engine counters (all engines; per-process; English counter names only)'
+    gpuSource = `Windows GPU Engine counters via ${win.gpuSrc === 'cim' ? 'CIM (Win32_PerfFormattedData_GPUPerformanceCounters_*, any display language)' : 'Get-Counter'} (all engines; per-process; ${win.gpu.length} instances, ~${win.gpuMs} ms per read)`
   }
   if (nvidiaOk !== false) {
     try {
@@ -535,6 +675,15 @@ async function sampleGpu(pids) {
       } else if (n && g) g.powerW = n.powerW
     } catch {
       nvidiaOk = false // don't spawn it every sample when it isn't installed
+    }
+  }
+  if (PLATFORM === 'linux') {
+    // browser GPU % always comes from fdinfo; whole-GPU % from it only when nothing better exists
+    const [u, rc6] = await Promise.all([sampleDrm(), g ? null : sampleRc6()])
+    linuxDrm = u
+    if (!g && rc6 !== null) {
+      g = { device: rc6, renderer: u?.renderer ?? null, tiler: null, encoder: u?.video ?? null, decoder: null, gpus: drm.rc6Files.length }
+      gpuSource = `Intel RC6 residency (whole GPU busy = 1 − idle; render GT)${u ? `; per-engine and browser GPU from DRM fdinfo (${[...drm.drivers].join(', ')})` : ''}`
     }
   }
   if (!g && PLATFORM === 'linux') {
@@ -550,13 +699,18 @@ async function sampleGpu(pids) {
       const v = await Promise.all(amdCards.map((c) => fsp.readFile(`/sys/class/drm/${c}/device/gpu_busy_percent`, 'utf8').then(Number, () => null)))
       const ok = v.filter((x) => Number.isFinite(x))
       if (ok.length) {
-        g = { device: Math.max(...ok), renderer: null, tiler: null, encoder: null, decoder: null, gpus: ok.length }
-        gpuSource = 'amdgpu sysfs gpu_busy_percent (whole GPU; no encoder split)'
+        g = { device: Math.max(...ok), renderer: linuxDrm?.renderer ?? null, tiler: null, encoder: linuxDrm?.video ?? null, decoder: null, gpus: ok.length }
+        gpuSource = `amdgpu sysfs gpu_busy_percent (whole GPU)${linuxDrm ? '; browser GPU from DRM fdinfo' : ''}`
       }
     }
   }
+  if (!g && PLATFORM === 'linux' && linuxDrm?.device != null) {
+    g = { device: linuxDrm.device, renderer: linuxDrm.renderer, tiler: null, encoder: linuxDrm.video, decoder: null, gpus: null }
+    gpuSource = `DRM fdinfo (${[...drm.drivers].join(', ')}): busiest engine, summed over ${process.getuid?.() === 0 ? 'all processes' : 'your processes only (run the server with sudo, e.g. --power, to include the compositor)'}`
+  }
   return g
 }
+let linuxDrm = null
 
 // ------------------------------------------------------------------ power
 
@@ -726,6 +880,10 @@ async function takeSample() {
   }
   // Windows per-process GPU counters: computed per browser view, so two sessions in different browsers don't share
   const procGpu = (v) => {
+    if (PLATFORM === 'linux' && linuxDrm && v?.pids) {
+      const b = P.drmUtilizationFor(linuxDrm, v.pids)
+      return { browser3d: b?.device ?? null, browserEncoder: b?.video ?? null, memMB: null }
+    }
     if (PLATFORM !== 'win32' || !win.gpu || !v?.pids) return { browser3d: gpu?.browser3d ?? null, browserEncoder: gpu?.browserEncoder ?? null, memMB: gpu?.browserGpuMemMB ?? null }
     const g = P.summarizeGpuEngines(win.gpu, v.pids)
     const mem = P.summarizeGpuProcessMemory(win.gpu, v.pids)
@@ -800,7 +958,7 @@ function memoryMethod() {
       ? 'footprint: phys_footprint via proc_pid_rusage (procstat helper; includes owned graphics/IOSurface memory); RSS kept for comparison (over-counts shared memory)'
       : 'RSS only (over-counts shared memory): footprint needs the procstat helper (clang)'
   if (PLATFORM === 'linux') return 'footprint: smaps_rollup PSS (shared pages split between processes; own-user processes only); RSS kept for comparison'
-  if (PLATFORM === 'win32') return 'footprint: private bytes (Win32_Process.PrivatePageCount) + GPU process memory counters; UNTESTED'
+  if (PLATFORM === 'win32') return 'footprint: private bytes (Win32_Process.PrivatePageCount) + GPU process memory counters'
   return 'RSS'
 }
 
@@ -854,15 +1012,15 @@ function summarize(sess) {
       attribution: sess.attribution,
       browserCpu:
         PLATFORM === 'win32'
-          ? 'Win32_Process Kernel+UserModeTime deltas (UNTESTED)'
+          ? 'Win32_Process Kernel+UserModeTime deltas'
           : PLATFORM === 'linux'
             ? `/proc/<pid>/stat utime+stime (1/${LINUX.clkTck} s resolution)`
             : helper.ok
               ? 'proc_pid_rusage user+system time (ns resolution, procstat helper); % of ONE core, summed over processes'
               : `ps cputime deltas (10 ms resolution)${helper.error ? '; ' + helper.error : ''}; % of ONE core, summed over processes`,
       browserRam: memoryMethod(),
-      gpu: gpuSource ?? 'none',
-      processGpu: PLATFORM === 'win32' ? 'GPU Engine counters per PID (UNTESTED)' : PROCESS_GPU ? (power.allTasksGpuMsPerS > 0 ? 'powermetrics tasks GPU ms/s' : 'powermetrics tasks: macOS reported 0 GPU ms/s for every task (not available)') : null,
+      gpu: gpuSource ?? `none: ${gpuNoneReason()}`,
+      processGpu: PLATFORM === 'win32' ? 'GPU Engine counters per PID' : PLATFORM === 'linux' ? (linuxDrm ? `DRM fdinfo per process (${[...drm.drivers].join(', ')}): busiest engine` : 'none (no DRM fdinfo usage stats)') : PROCESS_GPU ? (power.allTasksGpuMsPerS > 0 ? 'powermetrics tasks GPU ms/s' : 'powermetrics tasks: macOS reported 0 GPU ms/s for every task (not available)') : 'none: macOS does not expose per-process GPU use (--process-gpu tries powermetrics, which reads 0 on macOS 26)',
       power: power.ok ? 'powermetrics (+ CPU cluster frequency/residency)' : s.some((x) => x.gpuPowerW !== null) ? 'nvidia-smi power.draw' : s.some((x) => x.cpuPowerW !== null) ? 'RAPL package energy' : null,
       cores: { logical: os.cpus().length, ...coreTypes },
     },
