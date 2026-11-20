@@ -64,6 +64,32 @@ test('Safari: a WebKit-service root selects Safari + all WebKit services', () =>
   assert.deepEqual(selected.map((p) => p.pid).sort(), [60, 61, 62, 63])
 })
 
+test("Playwright WebKit (macOS): the tree plus its launchd-parented *.Development services, not Safari's", () => {
+  // pw_run.sh (bash) → Playwright; the WebKit services are children of launchd (real capture shape, 2026-11-20)
+  const procs = [
+    proc(1, 0, 'launchd'), proc(5, 1, 'node'), proc(80, 5, 'bash'), proc(81, 80, 'Playwright'),
+    proc(82, 1, 'com.apple.WebKit.Networking.Development'), proc(83, 1, 'com.apple.WebKit.GPU.Development'), proc(84, 1, 'com.apple.WebKit.WebContent.Development'),
+    proc(90, 1, 'Safari'), proc(91, 1, 'com.apple.WebKit.WebContent'),
+  ]
+  const { selected, mode } = P.selectBrowserProcs(procs, { rootPid: 80, platform: 'darwin' })
+  assert.equal(mode, 'tree+playwright-webkit')
+  assert.deepEqual(selected.map((p) => p.pid).sort(), [80, 81, 82, 83, 84])
+  assert.equal(P.procType('', 'com.apple.WebKit.WebContent.Development'), 'renderer')
+  assert.equal(P.procType('', 'com.apple.WebKit.GPU.Development'), 'gpu-process')
+  assert.equal(P.procType('', 'com.apple.WebKit.Networking'), 'utility-network')
+  // Safari's group leaves Playwright's services out
+  const safari = P.selectBrowserProcs(procs, { rootPid: 91, platform: 'darwin' })
+  assert.deepEqual(safari.selected.map((p) => p.pid).sort(), [90, 91])
+})
+
+test('Playwright Firefox (macOS): the GPU helper is kept and typed', () => {
+  const procs = [proc(1, 0, 'launchd'), proc(70, 5, 'firefox'), proc(71, 70, 'Nightly GPU Helper', '/x/Nightly GPU Helper -isForBrowser 70 gecko-crash-server-pipe.70 gpu'), proc(72, 70, 'plugin-container', '/x/plugin-container -childID 1 70 pipe tab')]
+  const { selected } = P.selectBrowserProcs(procs, { rootPid: 70, platform: 'darwin' })
+  assert.deepEqual(selected.map((p) => p.pid).sort(), [70, 71, 72])
+  assert.equal(P.procType(procs[2].cmd, procs[2].exe), 'gpu-process')
+  assert.equal(P.procType(procs[3].cmd, procs[3].exe), 'renderer')
+})
+
 test('Linux: renamed Firefox children are kept, extension hosts are not', () => {
   const procs = [proc(1, 0, 'systemd'), proc(70, 1, 'firefox'), proc(71, 70, 'Web Content'), proc(72, 70, 'RDD Process'), proc(73, 70, 'keepassxc-proxy', '/usr/bin/keepassxc-proxy /usr/lib/mozilla/native-messaging-hosts/x.json moz-extension://1/')]
   const { selected } = P.selectBrowserProcs(procs, { platform: 'linux' })

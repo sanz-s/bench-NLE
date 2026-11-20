@@ -95,6 +95,16 @@ const api = {
     return a.id
   },
 
+  /** An imported asset's bytes as base64: the runner generates each fixture once and imports it into every browser. */
+  async assetBase64(id) {
+    const a = getState().project.assets.find((x) => x.id === id)
+    if (!a?.file) throw new Error(`no file for asset ${id}`)
+    const buf = new Uint8Array(await a.file.arrayBuffer())
+    let s = ''
+    for (let i = 0; i < buf.length; i += 0x8000) s += String.fromCharCode.apply(null, buf.subarray(i, i + 0x8000))
+    return { name: a.file.name, type: a.file.type, b64: btoa(s) }
+  },
+
   assets() {
     return getState().project.assets.map((a) => ({ id: a.id, name: a.name, info: a.info }))
   },

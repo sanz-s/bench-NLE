@@ -102,10 +102,55 @@ test('report: medians, skipped and failed scenarios each get their section', () 
     ],
     checks: [{ level: 'warn', what: 'power', detail: 'on battery' }],
   })
-  assert.match(md, /\*\*Result: FAILED \(1 of 2 runs\)\*\*/)
+  assert.match(md, /\*\*Result: FAILED \(1 of 2 runs failed\)\*\*/)
   assert.match(md, /## Speed[\s\S]*\| s1 [\s\S]*pipelined/)
   assert.match(md, /## Scenarios with no passing run[\s\S]*error: boom/)
   assert.match(md, /## Skipped[\s\S]*av1 not encodable/)
   assert.match(md, /## Machine checks[\s\S]*warning[\s\S]*on battery/)
   assert.doesNotMatch(md.split('## Every run')[1].split('##')[0], /median/) // per-run table leaves out median rows
+})
+
+test('report with several browsers: comparison table, one section per engine, missing browser listed', () => {
+  const run = (browser, ms) => ({ browser, scenario: 'exp', run: 1, status: 'done', verified: true, conversionMs: ms })
+  const md = markdownReport({
+    title: 'T',
+    env: {},
+    mode: 'scenarios',
+    browsers: [
+      { key: 'chrome', name: 'Google Chrome', engine: 'Blink', status: 'ran', version: '1' },
+      { key: 'firefox', name: 'Firefox (Playwright build)', engine: 'Gecko', status: 'ran', version: '2' },
+      { key: 'webkit', name: 'WebKit (Playwright build, not Safari)', engine: 'WebKit', status: 'skipped', note: 'not installed: run `npx playwright install --with-deps`' },
+    ],
+    rows: [run('chrome', 100), run('firefox', 300)],
+    summary: [
+      { browser: 'chrome', scenario: 'exp', passedRuns: '1/1', median: run('chrome', 100) },
+      { browser: 'firefox', scenario: 'exp', passedRuns: '1/1', median: run('firefox', 300) },
+      { browser: 'firefox', scenario: 'hevc', skipped: true, reason: 'hevc not encodable in this browser' },
+    ],
+  })
+  assert.match(md, /\*\*Result: PASSED[^\n]*1 browser\(s\) not installed/)
+  assert.match(md, /## Engines side by side[\s\S]*\| exp +\| +100 \| +300 \|/)
+  assert.match(md, /## Google Chrome · Blink engine[\s\S]*### Speed/)
+  assert.match(md, /## Firefox \(Playwright build\) · Gecko engine[\s\S]*### Skipped[\s\S]*hevc not encodable/)
+  assert.match(md, /npx playwright install --with-deps/)
+})
+
+test('requestedBrowsers: all = one browser per engine; --chromium still works; unknown names fail', async () => {
+  const { requestedBrowsers } = await import('./browsers.mjs')
+  assert.deepEqual(requestedBrowsers([]), ['chrome', 'firefox', 'webkit'])
+  assert.deepEqual(requestedBrowsers(['--browsers', 'webkit,Chrome']), ['webkit', 'chrome'])
+  assert.deepEqual(requestedBrowsers(['--chromium']), ['chromium'])
+  assert.throws(() => requestedBrowsers(['--browsers', 'safari']), /unknown browser safari/)
+})
+
+test('WebKit (Safari) is skipped on Linux and Windows, whatever is installed', async () => {
+  const { browserAvailability } = await import('./browsers.mjs')
+  const fakePw = { webkit: { executablePath: () => process.execPath } } // a path that exists
+  for (const os of ['linux', 'win32']) {
+    const a = browserAvailability('webkit', fakePw, os)
+    assert.equal(a.ok, false)
+    assert.equal(a.platformSkip, true)
+    assert.match(a.fix, /only on macOS/)
+  }
+  assert.equal(browserAvailability('webkit', fakePw, 'darwin').ok, true)
 })

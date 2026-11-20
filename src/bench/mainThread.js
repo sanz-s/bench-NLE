@@ -57,14 +57,16 @@ export function startMainThreadWindow() {
     const lf = inWindow(loafs, start, end)
     const sorted = [...deltas].sort((a, b) => a - b)
     const supported = (PerformanceObserver.supportedEntryTypes ?? []).includes('longtask')
+    // Without the Long Tasks API (Firefox, WebKit) these are unknown, not 0: report null so nothing reads "TBT 0"
+    const lt0 = (v) => (supported ? v : null)
     return {
       windowMs: end - start,
       longTaskSupported: supported,
-      longTasks: lt.length,
-      longestTaskMs: lt.reduce((m, t) => Math.max(m, t.duration), 0),
-      longTaskTotalMs: total,
-      tbtMs: tbt,
-      blockedPct: end > start ? (Math.min(total, end - start) / (end - start)) * 100 : 0,
+      longTasks: lt0(lt.length),
+      longestTaskMs: lt0(lt.reduce((m, t) => Math.max(m, t.duration), 0)),
+      longTaskTotalMs: lt0(total),
+      tbtMs: lt0(tbt),
+      blockedPct: lt0(end > start ? (Math.min(total, end - start) / (end - start)) * 100 : 0),
       loafCount: (PerformanceObserver.supportedEntryTypes ?? []).includes('long-animation-frame') ? lf.length : null,
       loafBlockingMs: (PerformanceObserver.supportedEntryTypes ?? []).includes('long-animation-frame') ? lf.reduce((s, t) => s + (t.blocking ?? 0), 0) : null,
       rafFrames: deltas.length,
@@ -110,7 +112,9 @@ export function startMainThreadStream(onBucket, intervalMs = 500) {
         max = Math.max(max, lt.duration)
       }
     }
-    onBucket({ t: Date.now(), windowMs: end - a, longTasks: count, blockedMs: blocked, tbtMs: tbt, maxTaskMs: max, maxFrameGapMs: maxGap })
+    // no Long Tasks API (Firefox, WebKit): long-task numbers are unknown, not 0; frame gaps still count
+    const lt = (PerformanceObserver.supportedEntryTypes ?? []).includes('longtask')
+    onBucket({ t: Date.now(), windowMs: end - a, longTasks: lt ? count : null, blockedMs: lt ? blocked : null, tbtMs: lt ? tbt : null, maxTaskMs: lt ? max : null, maxFrameGapMs: maxGap })
     bucketStart = end
     maxGap = 0
   }

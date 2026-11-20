@@ -470,7 +470,7 @@ function browserView(procs, pct, rootPid) {
     if (v === undefined || P.isMediaService(p.exe)) continue
     any = true
     total += v
-    const type = P.procType(p.cmd)
+    const type = P.procType(p.cmd, p.exe)
     byType[type] = (byType[type] ?? 0) + v
   }
   return {

@@ -8,6 +8,23 @@ const isolationHeaders = {
   'Cross-Origin-Embedder-Policy': 'require-corp',
 }
 
+/**
+ * Sets the isolation headers on EVERY response, including 304 Not Modified. Vite's `headers` option leaves them off
+ * 304s, and WebKit then refuses the revalidated worker script ("blocked by Cross-Origin-Embedder-Policy"), so every
+ * second worker job failed in Safari/WebKit. Chrome and Firefox keep the cached headers, so they never showed it.
+ */
+function isolationOnEveryResponse() {
+  const handler = (_req, res, next) => {
+    for (const [k, v] of Object.entries(isolationHeaders)) res.setHeader(k, v)
+    next()
+  }
+  return {
+    name: 'isolation-on-every-response',
+    configureServer: (server) => void server.middlewares.use(handler),
+    configurePreviewServer: (server) => void server.middlewares.use(handler),
+  }
+}
+
 const BENCH_SERVER = process.env.BENCH_SERVER ?? 'http://127.0.0.1:5199'
 
 /**
@@ -47,7 +64,7 @@ function benchApiBridge() {
 }
 
 export default defineConfig({
-  plugins: [react(), benchApiBridge()],
+  plugins: [react(), isolationOnEveryResponse(), benchApiBridge()],
   server: { port: 5173, headers: isolationHeaders },
   preview: { port: 4173, headers: isolationHeaders },
   worker: { format: 'es' },

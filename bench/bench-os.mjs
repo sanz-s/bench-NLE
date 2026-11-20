@@ -7,7 +7,11 @@
  *   npm run bench:linux [-- options]
  *   npm run bench:win   [-- options]
  *
- * Options (everything else is passed to bench/run.mjs, e.g. --scenario, --runs, --matrix, --trace, --aac):
+ * Runs every major browser engine by default: Chrome (Blink), Firefox (Gecko) and WebKit, one after another
+ * (`--browsers chrome,firefox,webkit,edge,chromium` picks others). Install Playwright's Firefox and WebKit first with
+ *   npx playwright install --with-deps
+ *
+ * Options (everything else is passed to bench/run.mjs, e.g. --browsers, --scenario, --runs, --matrix, --trace, --aac):
  *   --check            only run the machine checks, then exit (1 if a check failed)
  *   --power            macOS: start the server with sudo + --powermetrics (CPU/GPU watts, GPU MHz, CPU clusters).
  *                      Linux: start it with sudo so RAPL package power is readable. Asks for your password once.
@@ -16,7 +20,8 @@
  *   --no-build         reuse the existing dist/ instead of running `vite build`
  *   --force            run even if this machine isn't the OS the script is for
  *
- * Results: bench-results/run-<timestamp>.json|csv (from run.mjs) and, through the server,
+ * Results: a Markdown report, bench-report-<os>-<time>.md, in the folder you ran it from;
+ * raw data in bench-results/run-<timestamp>.json|csv (from run.mjs) and, through the server,
  * bench-results/exports.jsonl (shown in the dashboard at http://127.0.0.1:<bench-port>/).
  */
 import { spawn, spawnSync } from 'node:child_process'
@@ -24,6 +29,7 @@ import { accessSync, constants, existsSync, readdirSync, readFileSync, statSync 
 import os from 'node:os'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
+import { BROWSERS, INSTALL_CMD, browserAvailability, requestedBrowsers } from './browsers.mjs'
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..')
 const TARGETS = { mac: 'darwin', linux: 'linux', win: 'win32' }
@@ -74,25 +80,6 @@ function sh(cmd, args, opts = {}) {
 }
 const onPath = (cmd) => (process.platform === 'win32' ? sh('where.exe', [cmd]) : sh('/bin/sh', ['-c', `command -v ${cmd}`])) !== null
 
-function chromePaths() {
-  if (process.platform === 'darwin') return ['/Applications/Google Chrome.app/Contents/MacOS/Google Chrome', path.join(os.homedir(), 'Applications/Google Chrome.app/Contents/MacOS/Google Chrome')]
-  if (process.platform === 'win32') {
-    const rel = 'Google\\Chrome\\Application\\chrome.exe'
-    return [process.env.PROGRAMFILES, process.env['PROGRAMFILES(X86)'], process.env.LOCALAPPDATA].filter(Boolean).map((d) => path.join(d, rel))
-  }
-  return ['/opt/google/chrome/chrome', '/usr/bin/google-chrome', '/usr/bin/google-chrome-stable']
-}
-
-async function bundledChromium() {
-  try {
-    const { chromium } = await import('playwright')
-    const p = chromium.executablePath()
-    return p && existsSync(p) ? p : null
-  } catch {
-    return null
-  }
-}
-
 /** True on a laptop running on battery (numbers vary with power state); null if unknown. */
 function onBattery() {
   if (process.platform === 'darwin') {
@@ -129,25 +116,38 @@ async function runChecks() {
   }
   if (own.has('--no-build') && !existsSync(path.join(root, 'dist', 'index.html'))) bad('dist/', '--no-build but dist/ is missing')
 
-  // browser
-  const chrome = chromePaths().find((p) => existsSync(p))
-  const bundled = await bundledChromium()
-  if (passHas('--chromium')) {
-    if (bundled) ok('browser', `bundled Chromium (--chromium): ${bundled}`)
-    else bad('browser', '--chromium but Playwright Chromium is not installed: run `npx playwright install chromium`')
-  } else if (chrome) ok('browser', `Google Chrome: ${chrome}`)
-  else if (bundled) warn('browser', `Google Chrome not found, falling back to Playwright Chromium (hardware encoders may differ): ${bundled}`)
-  else {
-    const fix = process.platform === 'linux' ? 'install Google Chrome, or run `npx playwright install --with-deps chromium`' : 'install Google Chrome, or run `npx playwright install chromium`'
-    bad('browser', `neither Google Chrome nor Playwright Chromium found: ${fix}`)
+  // browsers: one per engine by default (--browsers picks others); a missing one is skipped by run.mjs
+  let wanted = []
+  try {
+    wanted = requestedBrowsers(pass)
+  } catch (e) {
+    bad('browsers', e.message)
   }
+  let playwright = null
+  try {
+    playwright = await import('playwright')
+  } catch {
+    /* reported as a missing dependency above */
+  }
+  const missing = []
+  for (const key of wanted) {
+    const a = browserAvailability(key, playwright)
+    if (!a.ok && !a.platformSkip) missing.push(key)
+    if (a.platformSkip) ok(`browser ${key}`, `skipped: ${a.fix}`)
+    else if (a.ok && a.fallback) warn(`browser ${key}`, `${a.fallback}: ${a.path}`)
+    else if (a.ok) ok(`browser ${key}`, `${BROWSERS[key].name} (${BROWSERS[key].engine}): ${a.path}`)
+    else warn(`browser ${key}`, `${BROWSERS[key].name} not installed, will be skipped: ${a.fix}`)
+  }
+  if (wanted.length && wanted.every((k) => missing.includes(k) || browserAvailability(k, playwright).platformSkip)) bad('browsers', `none of ${wanted.join(', ')} can run here: run \`${INSTALL_CMD}\` (and install Google Chrome)`)
+  if (process.platform === 'linux' && wanted.some((k) => ['firefox', 'chromium'].includes(k)))
+    ok('browser libraries', `Playwright's Firefox/WebKit need system libraries; if one fails to start, run \`${INSTALL_CMD}\` (uses sudo apt)`)
 
   // headed vs headless
   if (process.platform === 'linux' && !passHas('--headless') && !process.env.DISPLAY && !process.env.WAYLAND_DISPLAY) {
     pass.push('--headless')
     warn('display', 'no DISPLAY / WAYLAND_DISPLAY: running headless, so GPU and hardware-encoder numbers may be software paths (use a desktop session or xvfb-run for headed)')
   } else if (passHas('--headless')) warn('display', '--headless: GPU and hardware-encoder numbers may be software paths')
-  else ok('display', 'headed Chrome (real GPU and hardware encoders)')
+  else ok('display', 'headed browsers (real GPU and hardware encoders)')
 
   // power state
   const batt = onBattery()

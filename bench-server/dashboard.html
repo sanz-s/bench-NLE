@@ -568,7 +568,7 @@ function renderSeriesCharts(root, series, tMax) {
   const cv = (k) => root.querySelector(`canvas[data-c="${k}"]`)
   drawChart(cv('cpu'), { tMax, yMax: 100, unit: '%', series: [{ name: 'System', color: css('--c-cpu'), points: pt('cpu') }, { name: 'Chrome', color: css('--c-chrome'), points: pt('chrome') }] })
   drawChart(cv('gpu'), { tMax, yMax: 100, unit: '%', series: [{ name: 'GPU', color: css('--c-gpu'), points: pt('gpu') }] })
-  drawChart(cv('main'), { tMax, yFloor: 40, unit: 'ms', series: [{ name: 'Blocked', color: css('--c-main'), kind: 'bar', barWidthMs: 500, unit: 'ms', points: M.map((b) => ({ t: b.t, v: b.blockedMs })) }] })
+  drawChart(cv('main'), { tMax, yFloor: 40, unit: 'ms', series: [{ name: 'Blocked', color: css('--c-main'), kind: 'bar', barWidthMs: 500, unit: 'ms', points: M.filter((b) => b.blockedMs != null).map((b) => ({ t: b.t, v: b.blockedMs })) }] })
   // Real footprint when the server measured it (phys_footprint / PSS / private bytes); RSS (over-counts shared memory) otherwise.
   const hasFp = S.some((s) => s.footprintMB != null)
   root.querySelector('[data-l="mem"]').textContent = hasFp ? 'browser processes, real footprint' : 'all browser processes (RSS, over-counts shared memory)'
@@ -613,9 +613,11 @@ function renderLive(mon) {
   const last = S.at(-1) ?? {}
   const elapsed = job.elapsedMs
   const eta = job.progress > 0.02 ? (elapsed / job.progress) * (1 - job.progress) : null
-  const blocked = M.reduce((a, b) => a + (b.blockedMs || 0), 0)
-  const tbt = M.reduce((a, b) => a + (b.tbtMs || 0), 0)
-  const longTasks = M.reduce((a, b) => a + (b.longTasks || 0), 0)
+  // buckets from a browser without the Long Tasks API carry null: show "—", never 0
+  const ltKnown = !M.length || M.some((b) => b.tbtMs != null)
+  const blocked = ltKnown ? M.reduce((a, b) => a + (b.blockedMs || 0), 0) : null
+  const tbt = ltKnown ? M.reduce((a, b) => a + (b.tbtMs || 0), 0) : null
+  const longTasks = ltKnown ? M.reduce((a, b) => a + (b.longTasks || 0), 0) : null
   const maxTask = M.reduce((a, b) => Math.max(a, b.maxTaskMs || 0), 0)
   const avg = (k) => {
     const v = S.map((s) => s[k]).filter((x) => x != null)
@@ -632,7 +634,7 @@ function renderLive(mon) {
     liveTile('System CPU', fmtPct(last.cpu), `avg ${fmtPct(avg('cpu'))}`, css('--c-cpu')),
     liveTile('Chrome CPU', fmtPct(last.chrome), `${last.chromeCores == null ? '' : (last.chromeCores / 100).toFixed(1) + ' cores busy'}`, css('--c-chrome')),
     liveTile('GPU', fmtPct(last.gpu), `avg ${fmtPct(avg('gpu'))}`, css('--c-gpu')),
-    liveTile('Main-thread blocked', fmtMs(blocked), `${longTasks} long tasks · TBT ${fmtMs(tbt)}`, css('--c-main')),
+    liveTile('Main-thread blocked', fmtMs(blocked), ltKnown ? `${longTasks} long tasks · TBT ${fmtMs(tbt)}` : 'no Long Tasks API in this browser', css('--c-main')),
     liveTile('Longest task', fmtMs(maxTask), maxTask > 50 ? 'over the 50 ms budget' : 'within 50 ms budget'),
     liveTile('Chrome memory', last.footprintMB ? `${(last.footprintMB / 1024).toFixed(2)} GB` : last.rssMB ? `${(last.rssMB / 1024).toFixed(2)} GB` : '—', last.footprintMB ? `footprint · RSS ${(last.rssMB / 1024).toFixed(2)} GB` : 'RSS', css('--c-mem')),
     ...(last.gpuW != null ? [liveTile('GPU power', `${last.gpuW.toFixed(1)} W`, `CPU ${last.cpuW?.toFixed(1) ?? '—'} W`)] : []),
@@ -826,7 +828,7 @@ async function openDetail(id) {
       ${liveTile('Encode wait', encWait(r) == null ? 'pipelined' : fmtMs(encWait(r)), encWait(r) == null ? 'Conversion API: not separable' : 'time waiting on encoders (back-pressure + flush), not encoder busy time')}
       ${liveTile('Speed', fmtX(r.derived?.realtimeFactor), `${r.frames} frames · ${pipeFps(r) ? pipeFps(r).toFixed(0) + ' fps end-to-end' : '—'}`)}
       ${liveTile('Encoder latency', fmtMs(enc.latencyAvg), enc.latencyP95 != null ? `p95 ${fmtMs(enc.latencyP95)}` : r.engine === 'conversion' ? 'not exposed by Conversion API' : '')}
-      ${liveTile('Main TBT', fmtMs(mt.tbtMs), `${mt.longTasks ?? 0} long tasks · longest ${fmtMs(mt.longestTaskMs)}`, css('--c-main'))}
+      ${liveTile('Main TBT', fmtMs(mt.tbtMs), mt.longTaskSupported === false ? 'no Long Tasks API in this browser' : `${mt.longTasks ?? 0} long tasks · longest ${fmtMs(mt.longestTaskMs)}`, css('--c-main'))}
       ${liveTile('CPU avg', fmtPct(sys.cpuSystemPct?.avg), `max ${fmtPct(sys.cpuSystemPct?.max)}`, css('--c-cpu'))}
       ${liveTile('GPU avg', fmtPct(sys.gpuDevicePct?.avg), `max ${fmtPct(sys.gpuDevicePct?.max)}`, css('--c-gpu'))}
       ${liveTile('Output', fmtBytes(r.output?.bytes), r.output?.bitrateKbps ? `${Math.round(r.output.bitrateKbps)} kb/s` : '')}
@@ -894,7 +896,7 @@ async function openCompare() {
     ['Encode wait', 'lower is better', (r) => encWait(r.report), fmtMs],
     ['Speed (× real time)', 'higher is better', (r) => r.report.derived?.realtimeFactor, fmtX],
     ['Main-thread TBT', 'lower is better', (r) => r.report.mainThread?.tbtMs, fmtMs],
-    ['Main-thread blocked total', 'lower is better', (r) => r.series.mainThread.reduce((a, b) => a + (b.blockedMs || 0), 0), fmtMs],
+    ['Main-thread blocked total', 'lower is better', (r) => (r.series.mainThread.some((b) => b.blockedMs != null) ? r.series.mainThread.reduce((a, b) => a + (b.blockedMs || 0), 0) : null), fmtMs],
     ['CPU avg', 'system', (r) => r.report.system?.cpuSystemPct?.avg, (v) => fmtPct(v)],
     ['Chrome CPU avg', 'cores busy', (r) => (r.report.system?.browserCpuPct?.avg ?? null) / 100 || null, (v) => (v == null ? '—' : `${v.toFixed(2)} c`)],
     ['GPU avg', 'whole GPU', (r) => r.report.system?.gpuDevicePct?.avg, (v) => fmtPct(v)],

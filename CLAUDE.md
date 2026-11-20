@@ -27,7 +27,13 @@ A browser-based non-linear video editor (NLE) whose purpose is **benchmarking Me
   - `--runs N` sets the repeat count (median is reported).
   - `--matrix` round-trip-tests every export format/codec combination.
   - `--trace` saves Chrome traces.
-  - `--headless` / `--chromium` choose a different browser setup.
+  - **Browsers** (`bench/browsers.mjs`): `--browsers all` (default) runs Chrome (Blink), Firefox (Gecko) and WebKit one after another in one invocation; also `edge`, `chromium`; `--chromium` = `--browsers chromium`. Firefox/WebKit are Playwright builds: `npx playwright install --with-deps`. A browser that isn't installed is skipped and listed in the report; one that crashes fails the run.
+    - **WebKit is macOS-only** (it stands for Safari): skipped on Linux and Windows whatever is installed (`platformSkip`, never counted by `--fail-on-skip`).
+    - Chromium-only parts are guarded per engine: launch args, `channel`, CDP metrics (`report.cdp` is absent elsewhere) and `--trace`. Firefox and WebKit have no Long Tasks API, so `mainThread` returns `null` (not 0) for TBT, long tasks, longest task and blocked %; rAF frame gaps work everywhere.
+    - Each generated fixture is made once, in the first browser that needs it (`assetBase64` in `harness.js`), written to `<out>/.fixtures-<stamp>/` and imported into the other browsers, so all engines convert identical bytes. The folder is removed at the end.
+    - Rows carry `browser` + `engine`; medians are per (browser, scenario); job labels start with the browser key. The report has a Browsers table, an engines side-by-side table and one section per browser.
+    - If the app isn't ready 30 s after loading, the page is reloaded once.
+  - `--headless` runs every browser headless.
   - `--aac auto|native|wasm` picks the AAC encoder under test (default auto). Each row records `audioEncoderImpl`.
   - **Results:** no console tables (they wrapped and misaligned). `bench/report-md.mjs` writes a padded Markdown report to the folder npm was run from (`INIT_CWD`): `bench-report-<mac|linux|win>-<time>.md`, or `matrix-report-…` for `--matrix`; `--report <file.md>` overrides. Setup, median-run speed and load tables, skipped/failed scenarios, every run, a column legend, and `bench-os` machine checks (passed in `BENCH_MACHINE_CHECKS`). Git-ignored. Raw JSON/CSV still go to `--out`.
   - `--warmup N` (default 1) adds unrecorded warm-up runs per scenario.
@@ -47,7 +53,7 @@ A browser-based non-linear video editor (NLE) whose purpose is **benchmarking Me
   - `bench/summary.test.mjs`: median and acceptance logic, plus the Markdown report builder.
 - `npm run test:ui`: UI smoke tests through the real UI. `bench/ui-smoke.mjs` covers editing; `bench/effects-smoke.mjs` covers text, stickers, filters, transitions, copy/paste and effects exports. Screenshots go to `bench-results/ui-smoke/` and `bench-results/effects-smoke/`.
 - `node bench/showcase.mjs [--files a b c] [--export] [--no-sfx] [--test]`: opens headed Chrome on the running dev server (or starts one), imports 3 videos (or waits for you to), builds the all-tools showcase edit (`buildShowcase` in `harness.js`) and leaves the window open. It also imports the synthesized SFX kit from `bench/sfx/` (`node bench/make-sfx.mjs` regenerates it); any asset named `sfx-<name>.wav` is placed on A2+. Export only with `--export`.
-- `npx playwright install chromium` is needed only for `--chromium`. The default uses the installed Chrome.
+- `npx playwright install --with-deps` installs Playwright's Chromium, Firefox and WebKit (on Linux also their system libraries, via sudo apt). Chrome itself is the installed Google Chrome; without it Playwright's Chromium is used and the report says so.
 
 ## Architecture (data flow)
 - `src/media/`: the Mediabunny-only layer, with no React. It runs in both the main thread and the worker.
@@ -156,7 +162,7 @@ The `JobReport` shape built in `src/bench/metrics.js` (`deriveMetrics`) and `job
 - **CPU/GPU/RAM limits (known):**
   - Media Engine load and per-tab attribution inside a user's own Chrome are not measurable.
   - macOS per-process GPU: powermetrics lists a GPU ms/s column but reports 0.00 for every task on macOS 26 (`--process-gpu` picks it up if that changes).
-  - Safari is a WebKit name group, shared with other WebKit apps.
+  - Safari is a WebKit name group, shared with other WebKit apps. Playwright's WebKit on macOS runs its WebContent/GPU/Networking work in launchd-parented `com.apple.WebKit.*.Development` services, outside the browser's process tree: `selectBrowserProcs` adds them when the tree contains `Playwright` (mode `tree+playwright-webkit`; shared if several Playwright WebKits run at once). Safari's group leaves the `.Development` services out. Firefox's `… GPU Helper` and WebKit's process names are in `BROWSER_EXE_RE`, and `procType(cmd, exe)` types WebKit processes by executable name.
   - Windows paths are untested.
   - **Native vs WASM AAC sizes differ:** on macOS Chrome the native AAC encoder wrote ~47 kb/s for the synthetic fixture tone, where the WASM encoder wrote ~194 kb/s for the same requested quality (2026-11-18, `bench/regress.mjs` B1). So compare encode speed between the two with output size in mind.
 - **Output verification:** `verifyOutput` (in `jobRunner.js`) re-probes each output and decodes it (`decodeCheck` in `probe.js`).
@@ -171,7 +177,7 @@ The `JobReport` shape built in `src/bench/metrics.js` (`deriveMetrics`) and `job
 - **Failure cleanup:** `exportProject` and `runConversion` run inside `try` / `catch` / `finally`. On any error or cancel they call `output.cancel()` and `handle.fail()`, which aborts a streamed file's writable. Readers, decoders, the asset pool and the input are always disposed. Audio samples are closed even if `add()` throws.
 
 ## Gotchas
-- COOP `same-origin` and COEP `require-corp` are required. The extension WASM uses shared-memory threads, so without them it falls back to a slower path and skews the benchmarks. Don't load cross-origin resources (fonts, CDNs) without CORP/CORS.
+- COOP `same-origin` and COEP `require-corp` are required. `isolationOnEveryResponse` in `vite.config.js` sets them on every response, 304s included: Vite's `headers` option leaves them off 304 Not Modified, and WebKit then refuses the revalidated worker script ("blocked by Cross-Origin-Embedder-Policy"), so every second worker job failed there. The extension WASM uses shared-memory threads, so without them it falls back to a slower path and skews the benchmarks. Don't load cross-origin resources (fonts, CDNs) without CORP/CORS.
 - Check Mediabunny API names against `node_modules/mediabunny/dist/mediabunny.d.ts`, not against the docs or memory. Track getters there are async (`getCodec()`, `getDisplayWidth()`, …).
 - Always `close()` `VideoSample`/`AudioSample` objects. CanvasSink canvases come from a pool, so draw them immediately.
 - MP4/MOV use `fastStart: 'in-memory'` only with `BufferTarget`. Streaming to disk (`StreamTarget` + `showSaveFilePicker`, Chromium only) uses `fastStart: false`.

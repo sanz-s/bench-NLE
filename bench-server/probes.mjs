@@ -28,9 +28,14 @@ export const BROWSER_EXE_RE = new RegExp(
       'Arc(?: Helper.*)?',
       'Ulaa(?: Helper.*)?',
       'firefox(?:-bin)?',
+      '(?:Firefox|Nightly)(?: GPU Helper| Media Plugin Helper)?', // macOS app helpers (Nightly = Playwright's Firefox)
       'plugin-container',
       'Safari',
-      'com\\.apple\\.WebKit\\.(?:WebContent|GPU|Networking)',
+      'com\\.apple\\.WebKit\\.(?:WebContent|GPU|Networking)(?:\\.Development)?', // .Development = Playwright's WebKit
+      // Playwright's WebKit build: pw_run.sh → Playwright (macOS/Windows UI) or MiniBrowser (Linux) + WebKit*Process
+      'Playwright(?:\\.exe)?',
+      'MiniBrowser',
+      'WebKit(?:Web|Network|GPU)Process(?:\\.exe)?',
       // Linux / Windows executable names
       'chrome',
       'chromium(?:-browse)?',
@@ -50,7 +55,12 @@ export const isBrowserExe = (exe) => BROWSER_EXE_RE.test(exe ?? '') && !/crashpa
  */
 export const isMediaService = (exe) => /^(?:VTEncoderXPCService|VTDecoderXPCService)$/.test(exe ?? '')
 /** Safari's helpers are XPC services parented by launchd and shared with other WebKit apps (Mail, …). */
-export const isWebKitService = (exe) => /^com\.apple\.WebKit\./.test(exe ?? '')
+export const isWebKitService = (exe) => /^com\.apple\.WebKit\./.test(exe ?? '') && !isPlaywrightWebKitService(exe)
+/**
+ * Playwright's WebKit on macOS: the same XPC services, built as `com.apple.WebKit.*.Development` and also parented by
+ * launchd, so they are never in the browser's process tree. The suffix keeps them apart from Safari's and Mail's.
+ */
+export const isPlaywrightWebKitService = (exe) => /^com\.apple\.WebKit\.\w+\.Development$/.test(exe ?? '')
 
 // ------------------------------------------------------------------ process tables
 
@@ -356,7 +366,7 @@ export function browserRootOf(procs, pid) {
 
 /**
  * The processes counted as "the browser" for one sample.
- *  - rootPid given → that process tree. A WebKit service root means Safari: Safari + every com.apple.WebKit.* service
+ *  - rootPid given → that process tree (+ Playwright WebKit's launchd services on macOS). A WebKit service root means Safari: Safari + every com.apple.WebKit.* service
  *    (they are launchd children shared with other WebKit apps, so this is a name group, not a tree).
  *  - no rootPid → name match: every browser main process (parent isn't a browser) plus its descendants.
  * Non-browser children (extension native-messaging hosts, crash reporters) are dropped; a given root is always kept.
@@ -374,6 +384,13 @@ export function selectBrowserProcs(procs, { rootPid = null, platform = process.p
   } else if (root) {
     mode = 'tree'
     selected = withDescendants(procs, [root])
+    // Playwright's WebKit on macOS: page, GPU and network work runs in launchd-parented services outside the tree.
+    // Several Playwright WebKits running at once would share these (they can't be told apart).
+    if (platform === 'darwin' && selected.some((p) => p.exe === 'Playwright')) {
+      mode = 'tree+playwright-webkit'
+      const have = new Set(selected.map((p) => p.pid))
+      selected = [...selected, ...procs.filter((p) => isPlaywrightWebKitService(p.exe) && !have.has(p.pid))]
+    }
   } else {
     mode = 'name-match'
     selected = withDescendants(
@@ -391,11 +408,15 @@ export function selectBrowserProcs(procs, { rootPid = null, platform = process.p
 
 // ------------------------------------------------------------------ Chrome process types
 
-export function procType(cmd) {
+export function procType(cmd, exe = '') {
+  // WebKit (Safari, Playwright's WebKit) names its roles in the executable
+  if (/WebContent|WebKitWebProces/.test(exe)) return 'renderer'
+  if (/^com\.apple\.WebKit\.GPU|WebKitGPUProces/.test(exe)) return 'gpu-process'
+  if (/^com\.apple\.WebKit\.Networking|WebKitNetworkPr/.test(exe)) return 'utility-network'
   const m = /--type=([\w-]+)/.exec(cmd ?? '')
   if (!m) {
     // Firefox children name their role as the last argument: "… <parent pid> <ipc pipe> tab"
-    const ff = /plugin-container\S*\s.*\s(tab|gpu|rdd|socket|utility|gmplugin|forkserver)\s*$/.exec(cmd ?? '')
+    const ff = /(?:plugin-container|GPU Helper)\S*\s.*\s(tab|gpu|rdd|socket|utility|gmplugin|forkserver)\s*$/.exec(cmd ?? '')
     if (ff) return { tab: 'renderer', gpu: 'gpu-process', rdd: 'utility-media', socket: 'utility-network', utility: 'utility', gmplugin: 'utility-media', forkserver: 'utility' }[ff[1]]
     return 'browser'
   }

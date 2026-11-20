@@ -7,6 +7,7 @@ export benchmarking: conversion time, encode time, main-thread blocking, and CPU
 ## Quick start
 ```bash
 npm install
+npx playwright install --with-deps   # browsers for the benchmarks: Chromium, Firefox, WebKit (+ system libraries on Linux, via sudo)
 npm run dev                 # http://localhost:5173  (the editor; works on its own)
 npm run bench:server        # optional, in a 2nd terminal: CPU/GPU sampler → "Metrics on" in the top bar
 ```
@@ -26,13 +27,23 @@ timeline, edit, and press **Export** (⌘E). Each export or conversion appears i
 can download the results as JSON or CSV.
 
 ## Automated benchmarks (Playwright)
-One command per OS checks the machine, starts the bench-server, builds, runs every scenario, then stops the server:
+The benchmarks run in every major browser engine, one after another: **Chrome (Blink)**, **Firefox (Gecko)** and **WebKit** (Safari's engine). Firefox and WebKit are Playwright's own builds, so install them first:
+```bash
+npx playwright install --with-deps    # on Linux --with-deps also installs the browsers' system libraries (asks for sudo)
+```
+- **WebKit runs on macOS only.** Safari exists only on macOS, so `bench:linux` and `bench:win` skip WebKit (the report says why) and run Chrome and Firefox.
+- A browser that isn't installed is skipped and listed in the report with the install command. `--browsers chrome,firefox,webkit,edge,chromium` picks others (`all`, the default, is one per engine).
+- Each test clip is generated once, in the first browser, and the same file is imported into the others, so every engine converts identical input.
+- Not every number exists in every engine: TBT and longest task need the Long Tasks API, and main-thread task time needs CDP, both Chromium-only. They show as "—" for Firefox and WebKit. Frames over 50 ms works everywhere.
+
+One command per OS checks the machine, starts the bench-server, builds, runs every scenario in each browser, then stops the server:
 ```bash
 npm run bench:mac                     # macOS   (add -- --power for watts via sudo powermetrics)
 npm run bench:linux                   # Linux   (headless automatically when there is no display; --power = sudo for RAPL)
 npm run bench:win                     # Windows (sampler written but not yet verified on Windows hardware)
 npm run bench:mac -- --check          # machine checks only: browser, GPU source, power state, results file
 npm run bench:mac -- --scenario export-h264-worker --runs 5   # any bench/run.mjs flag passes through
+npm run bench:mac -- --browsers chrome  # just one browser
 ```
 A bench-server already running on :5199 is reused and left running; `--bench-port N` picks another port, `--no-server` skips CPU/GPU, `--no-build` reuses `dist/`.
 
