@@ -546,14 +546,37 @@ function attachHover(cv, format) {
   cv.addEventListener('pointerleave', leave)
 }
 
-/** Builds the 4 standard charts (CPU, GPU, main thread, memory) into a container from a job's series. */
-function renderSeriesCharts(root, series, tMax) {
+/** Short name for where GPU % came from (the server's method.gpu / health.gpuSource text). */
+function gpuSourceLabel(src) {
+  if (!src) return 'source not reported'
+  if (/^none/.test(src)) return 'not available on this machine'
+  if (/^ioreg/.test(src)) return 'ioreg'
+  if (/nvidia-smi/.test(src)) return 'nvidia-smi'
+  if (/amdgpu/.test(src)) return 'amdgpu sysfs'
+  if (/RC6/.test(src)) return 'Intel RC6'
+  if (/fdinfo/.test(src)) return 'DRM fdinfo'
+  if (/Windows/.test(src)) return /CIM/.test(src) ? 'Windows GPU counters (CIM)' : 'Windows GPU counters'
+  return src.split(' (')[0]
+}
+/** The browser a record ran in: the runner's tag, else the user agent. */
+function browserName(report, label = '') {
+  const tagged = report?.browser?.name ?? { chrome: 'Chrome', edge: 'Edge', chromium: 'Chromium', firefox: 'Firefox', webkit: 'WebKit' }[/^(\w+) · /.exec(label)?.[1]]
+  if (tagged) return tagged.split(' (')[0]
+  const ua = report?.env?.userAgent ?? ''
+  return /Firefox\//.test(ua) ? 'Firefox' : /Edg\//.test(ua) ? 'Edge' : /Chrome\//.test(ua) ? 'Chrome' : /Safari\//.test(ua) ? 'Safari / WebKit' : 'Browser'
+}
+
+/**
+ * Builds the 4 standard charts (CPU, GPU, main thread, memory) into a container from a job's series.
+ * `labels`: { gpuSource, browser } for the legends (they change per record, so they're set on every call).
+ */
+function renderSeriesCharts(root, series, tMax, labels = {}) {
   if (!root._built) {
     root.innerHTML = `${zoomBarHTML()}
-      <div class="chart"><div class="chart-head"><span class="chart-title">CPU</span><span class="legend"><span><i class="swatch" style="background:var(--c-cpu)"></i>System</span><span><i class="swatch" style="background:var(--c-chrome)"></i>Chrome (share of all cores)</span></span></div><canvas data-c="cpu"></canvas></div>
-      <div class="chart"><div class="chart-head"><span class="chart-title">GPU utilization</span><span class="legend muted">whole GPU (ioreg)</span></div><canvas data-c="gpu"></canvas></div>
+      <div class="chart"><div class="chart-head"><span class="chart-title">CPU</span><span class="legend"><span><i class="swatch" style="background:var(--c-cpu)"></i>System</span><span><i class="swatch" style="background:var(--c-chrome)"></i><span class="browser-name">Browser</span> (share of all cores)</span></span></div><canvas data-c="cpu"></canvas></div>
+      <div class="chart"><div class="chart-head"><span class="chart-title">GPU utilization</span><span class="legend muted">whole GPU (<span class="gpu-src">…</span>)</span></div><canvas data-c="gpu"></canvas></div>
       <div class="chart"><div class="chart-head"><span class="chart-title">Main-thread blocking</span><span class="legend muted">long-task time per 0.5 s</span></div><canvas data-c="main"></canvas></div>
-      <div class="chart"><div class="chart-head"><span class="chart-title">Chrome memory</span><span class="legend muted" data-l="mem">all browser processes (RSS)</span></div><canvas data-c="mem"></canvas></div>`
+      <div class="chart"><div class="chart-head"><span class="chart-title">Browser memory</span><span class="legend muted" data-l="mem">all browser processes (RSS)</span></div><canvas data-c="mem"></canvas></div>`
     root._built = true
     const z = zoomGroup(root)
     bindZoomBar(root, z)
@@ -562,11 +585,13 @@ function renderSeriesCharts(root, series, tMax) {
       attachHover(cv, (v, s) => (v == null ? '—' : s.unit === 'GB' ? `${v.toFixed(2)} GB` : s.unit === 'ms' ? `${Math.round(v)} ms` : `${v.toFixed(0)}%`))
     })
   }
+  root.querySelectorAll('.gpu-src').forEach((e) => (e.textContent = gpuSourceLabel(labels.gpuSource)))
+  root.querySelectorAll('.browser-name').forEach((e) => (e.textContent = labels.browser ?? 'Browser'))
   const S = series?.samples ?? []
   const M = series?.mainThread ?? []
   const pt = (key, scale = 1) => S.map((s) => ({ t: s.t, v: s[key] == null ? null : s[key] * scale }))
   const cv = (k) => root.querySelector(`canvas[data-c="${k}"]`)
-  drawChart(cv('cpu'), { tMax, yMax: 100, unit: '%', series: [{ name: 'System', color: css('--c-cpu'), points: pt('cpu') }, { name: 'Chrome', color: css('--c-chrome'), points: pt('chrome') }] })
+  drawChart(cv('cpu'), { tMax, yMax: 100, unit: '%', series: [{ name: 'System', color: css('--c-cpu'), points: pt('cpu') }, { name: labels.browser ?? 'Browser', color: css('--c-chrome'), points: pt('chrome') }] })
   drawChart(cv('gpu'), { tMax, yMax: 100, unit: '%', series: [{ name: 'GPU', color: css('--c-gpu'), points: pt('gpu') }] })
   drawChart(cv('main'), { tMax, yFloor: 40, unit: 'ms', series: [{ name: 'Blocked', color: css('--c-main'), kind: 'bar', barWidthMs: 500, unit: 'ms', points: M.filter((b) => b.blockedMs != null).map((b) => ({ t: b.t, v: b.blockedMs })) }] })
   // Real footprint when the server measured it (phys_footprint / PSS / private bytes); RSS (over-counts shared memory) otherwise.
@@ -632,14 +657,14 @@ function renderLive(mon) {
   $('.progress-meta', live).innerHTML = `<span class="mono">${Math.round(job.progress * 100)}%</span><span>elapsed <b class="mono">${fmtMs(elapsed)}</b></span><span>left ≈ <b class="mono">${eta == null ? '—' : fmtMs(eta)}</b></span>${job.mediaDuration ? `<span>${job.mediaDuration.toFixed(1)} s of media</span>` : ''}`
   $('.tiles', live).innerHTML = [
     liveTile('System CPU', fmtPct(last.cpu), `avg ${fmtPct(avg('cpu'))}`, css('--c-cpu')),
-    liveTile('Chrome CPU', fmtPct(last.chrome), `${last.chromeCores == null ? '' : (last.chromeCores / 100).toFixed(1) + ' cores busy'}`, css('--c-chrome')),
+    liveTile(`${browserName(null, job.label)} CPU`, fmtPct(last.chrome), `${last.chromeCores == null ? '' : (last.chromeCores / 100).toFixed(1) + ' cores busy'}`, css('--c-chrome')),
     liveTile('GPU', fmtPct(last.gpu), `avg ${fmtPct(avg('gpu'))}`, css('--c-gpu')),
     liveTile('Main-thread blocked', fmtMs(blocked), ltKnown ? `${longTasks} long tasks · TBT ${fmtMs(tbt)}` : 'no Long Tasks API in this browser', css('--c-main')),
     liveTile('Longest task', fmtMs(maxTask), maxTask > 50 ? 'over the 50 ms budget' : 'within 50 ms budget'),
-    liveTile('Chrome memory', last.footprintMB ? `${(last.footprintMB / 1024).toFixed(2)} GB` : last.rssMB ? `${(last.rssMB / 1024).toFixed(2)} GB` : '—', last.footprintMB ? `footprint · RSS ${(last.rssMB / 1024).toFixed(2)} GB` : 'RSS', css('--c-mem')),
+    liveTile(`${browserName(null, job.label)} memory`, last.footprintMB ? `${(last.footprintMB / 1024).toFixed(2)} GB` : last.rssMB ? `${(last.rssMB / 1024).toFixed(2)} GB` : '—', last.footprintMB ? `footprint · RSS ${(last.rssMB / 1024).toFixed(2)} GB` : 'RSS', css('--c-mem')),
     ...(last.gpuW != null ? [liveTile('GPU power', `${last.gpuW.toFixed(1)} W`, `CPU ${last.cpuW?.toFixed(1) ?? '—'} W`)] : []),
   ].join('')
-  renderSeriesCharts($('.charts', live), mon.series, Math.max(10000, elapsed + 1000))
+  renderSeriesCharts($('.charts', live), mon.series, Math.max(10000, elapsed + 1000), { gpuSource: health?.gpuSource, browser: browserName(null, job.label) })
 }
 
 async function pollMonitor() {
@@ -803,7 +828,7 @@ async function openDetail(id) {
     if (!v.hiddenMs && !v.startedHidden && !v.endedHidden) return `visible throughout${v.focusedAtStart === false || v.blurs ? ' <span class="muted">(window not focused at some point)</span>' : ''}`
     return `<span class="warn">⚠ hidden ${(v.hiddenMs / 1000).toFixed(1)} s (${v.hiddenPct.toFixed(0)} % of the job)${v.startedHidden ? ', started hidden' : ''}: timers, rAF and main-thread jobs are throttled, so main-thread and timing numbers aren’t comparable</span>`
   }
-  // How Chrome CPU / memory were attributed. Name matches and older records may include other browsers' processes.
+  // How browser CPU / memory were attributed. Name matches and older records may include other browsers' processes.
   const attributionText = (s) => {
     const a = s.method?.attribution
     if (!a) return s.processFilter ? `<span class="warn">⚠ ${esc(s.processFilter)} (older record)</span>` : '—'
@@ -851,9 +876,9 @@ async function openDetail(id) {
       ${kv('Encoder latency max', fmtMs(enc.latencyMax))}
       ${kv('Main thread blocked', `${fmtPct(mt.blockedPct, 1)} of job`)}
       ${kv('Frame gaps > 50 ms', mt.rafGapsOver50ms ?? '—')}
-      ${kv('Chrome CPU avg', sys.browserCpuPct ? `${(sys.browserCpuPct.avg / 100).toFixed(1)} cores` : '—')}
+      ${kv('Browser CPU avg', sys.browserCpuPct ? `${(sys.browserCpuPct.avg / 100).toFixed(1)} cores` : '—')}
       ${Object.entries(sys.browserCpuByType ?? {}).map(([k, s]) => kv(`  ${k}`, `${(s.avg / 100).toFixed(2)} cores avg`)).join('')}
-      ${kv('Chrome memory max', sys.browserFootprintMB ? `${(sys.browserFootprintMB.max / 1024).toFixed(2)} GB footprint · ${(sys.browserRssMB.max / 1024).toFixed(2)} GB RSS` : sys.browserRssMB ? `${(sys.browserRssMB.max / 1024).toFixed(2)} GB RSS` : '—')}
+      ${kv('Browser memory max', sys.browserFootprintMB ? `${(sys.browserFootprintMB.max / 1024).toFixed(2)} GB footprint · ${(sys.browserRssMB.max / 1024).toFixed(2)} GB RSS` : sys.browserRssMB ? `${(sys.browserRssMB.max / 1024).toFixed(2)} GB RSS` : '—')}
       ${r.memory?.mainHeapPeakMB != null || r.memory?.pageTotalMB != null ? kv('JS heap', `main ${r.memory.mainHeapPeakMB != null ? r.memory.mainHeapPeakMB.toFixed(0) + ' MB peak' : '—'} · page+workers ${r.memory.pageTotalMB != null ? r.memory.pageTotalMB.toFixed(0) + ' MB' : '—'}`) : ''}
       ${sys.browserGpuMemMB ? kv('Browser GPU memory', `${sys.browserGpuMemMB.max.toFixed(0)} MB max`) : ''}
       ${sys.gpuPowerW ? kv('GPU / CPU power', `${sys.gpuPowerW.avg.toFixed(2)} W / ${sys.cpuPowerW?.avg.toFixed(2)} W`) : ''}
@@ -879,7 +904,7 @@ async function openDetail(id) {
     el.hidden = true
     renderTable()
   }
-  renderSeriesCharts($('#detail-charts'), rec.series, Math.max(dur, 1000))
+  renderSeriesCharts($('#detail-charts'), rec.series, Math.max(dur, 1000), { gpuSource: rec.report.system?.method?.gpu, browser: browserName(rec.report, rec.report.label) })
   el.scrollIntoView({ behavior: 'smooth', block: 'start' })
 }
 
@@ -898,7 +923,7 @@ async function openCompare() {
     ['Main-thread TBT', 'lower is better', (r) => r.report.mainThread?.tbtMs, fmtMs],
     ['Main-thread blocked total', 'lower is better', (r) => (r.series.mainThread.some((b) => b.blockedMs != null) ? r.series.mainThread.reduce((a, b) => a + (b.blockedMs || 0), 0) : null), fmtMs],
     ['CPU avg', 'system', (r) => r.report.system?.cpuSystemPct?.avg, (v) => fmtPct(v)],
-    ['Chrome CPU avg', 'cores busy', (r) => (r.report.system?.browserCpuPct?.avg ?? null) / 100 || null, (v) => (v == null ? '—' : `${v.toFixed(2)} c`)],
+    ['Browser CPU avg', 'cores busy', (r) => (r.report.system?.browserCpuPct?.avg ?? null) / 100 || null, (v) => (v == null ? '—' : `${v.toFixed(2)} c`)],
     ['GPU avg', 'whole GPU', (r) => r.report.system?.gpuDevicePct?.avg, (v) => fmtPct(v)],
     ['Encoder latency avg', 'per frame', (r) => r.report.encoder?.latencyAvg, fmtMs],
     ['Output size', '', (r) => r.report.output?.bytes, fmtBytes],
@@ -1028,6 +1053,15 @@ window.addEventListener('resize', () => {
   await loadRecords()
   pollMonitor()
   setInterval(() => !liveJobId && loadRecords(), 10000)
+  // the server learns its GPU source from its first samples: refresh it for the live chart's legend
+  setInterval(async () => {
+    try {
+      health = await (await fetch('/health')).json()
+      $('#env').textContent = `${health.cpuModel} · ${health.cores} cores · ${health.totalMemGB.toFixed(0)} GB · GPU via ${health.gpuSource ?? 'n/a'}${health.powermetrics ? ' · power via powermetrics' : ''}`
+    } catch {
+      /* shown by setConn */
+    }
+  }, 15000)
 })()
 </script>
 </body>
