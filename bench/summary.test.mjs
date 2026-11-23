@@ -154,3 +154,10 @@ test('WebKit (Safari) is skipped on Linux and Windows, whatever is installed', a
   }
   assert.equal(browserAvailability('webkit', fakePw, 'darwin').ok, true)
 })
+
+test('report: an output only the software decoder could read is marked "yes (software decode)"', () => {
+  const sw = { scenario: 's1', run: 1, status: 'done', verified: true, conversionMs: 100, verifyDecoder: 'software (the default decoder failed: Decoding error.)' }
+  const md = markdownReport({ title: 'T', env: {}, mode: 'scenarios', rows: [sw], summary: [{ scenario: 's1', passedRuns: '1/1', median: sw }], checks: [] })
+  assert.match(md.split('## Every run')[1], /yes \(software decode\)/)
+  assert.match(md, /PASSED/)
+})

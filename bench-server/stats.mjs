@@ -35,9 +35,11 @@ export function stat(values, weights) {
  * System-wide numbers (CPU, GPU, power) include them; browser numbers do too when they ran in the same browser.
  * @param {{rootPid: number|null, overlaps: Map<string, {label: string, rootPid: number|null, from: number, to: number|null}>}} sess
  */
-export function overlapSummary(sess, now = Date.now()) {
+export function overlapSummary(sess, now = Date.now(), ignore = () => false) {
   if (!sess.overlaps?.size) return null
-  const sessions = [...sess.overlaps.entries()].map(([id, o]) => ({
+  const live = [...sess.overlaps.entries()].filter(([id]) => !ignore(id))
+  if (!live.length) return null
+  const sessions = live.map(([id, o]) => ({
     id,
     label: o.label,
     sameBrowser: o.rootPid === sess.rootPid,
@@ -48,6 +50,20 @@ export function overlapSummary(sess, now = Date.now()) {
     sessions,
     note: `Another job ran at the same time: system CPU, GPU and power include it${sameBrowser ? ', and so do the browser-process numbers (same browser)' : '; browser-process numbers are per session (different browser)'}.`,
   }
+}
+
+/**
+ * Phantom sessions: created, but the page never used them (no request after the start). That happens when the page
+ * gave up waiting for the start answer (slow server) and ran its job without a session; the server still made one.
+ * A real job claims its session within milliseconds (job-start mark), so `graceMs` of silence is plenty.
+ */
+export function isPhantomSession(s, now, graceMs) {
+  return !!s && !s.claimed && !s.end && now - s.start > graceMs
+}
+export function phantomSessions(sessions, now, graceMs) {
+  const out = []
+  for (const [id, s] of sessions) if (isPhantomSession(s, now, graceMs)) out.push(id)
+  return out
 }
 
 /** Sessions with no request for `timeoutMs` (tab closed, reloaded or crashed mid-job). */

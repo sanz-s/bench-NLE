@@ -25,7 +25,7 @@ import { fileURLToPath } from 'node:url'
 import { execFile, execFileSync, spawn } from 'node:child_process'
 import { promisify } from 'node:util'
 import * as P from './probes.mjs'
-import { expiredSessions, overlapSummary, stat } from './stats.mjs'
+import { expiredSessions, isPhantomSession, overlapSummary, phantomSessions, stat } from './stats.mjs'
 
 const execFileP = promisify(execFile)
 let spawnCount = 0 // sampler overhead: child processes started
@@ -644,6 +644,24 @@ function gpuNoneReason() {
   return 'no GPU source for this OS'
 }
 let nvidiaOk = PLATFORM === 'darwin' ? false : null // null = not probed yet
+const nvidiaPower = { w: null, at: 0, running: false, lastRun: 0 }
+function refreshNvidiaPower() {
+  if (nvidiaPower.running || Date.now() - nvidiaPower.lastRun < 5000) return
+  nvidiaPower.running = true
+  nvidiaPower.lastRun = Date.now()
+  run('nvidia-smi', ['--query-gpu=utilization.gpu,utilization.encoder,utilization.decoder,power.draw', '--format=csv,noheader,nounits'], { timeout: 8000, windowsHide: true })
+    .then(({ stdout }) => {
+      nvidiaOk = true
+      const n = P.parseNvidiaSmi(stdout)
+      if (n?.powerW !== null && n?.powerW !== undefined) Object.assign(nvidiaPower, { w: n.powerW, at: Date.now() })
+    })
+    .catch(() => {
+      nvidiaOk = false
+    })
+    .finally(() => {
+      nvidiaPower.running = false
+    })
+}
 let amdCards = null
 async function sampleGpu(pids) {
   if (PLATFORM === 'darwin') {
@@ -664,7 +682,13 @@ async function sampleGpu(pids) {
     g.browserGpuMemMB = mem.dedicatedMB + mem.sharedMB
     gpuSource = `Windows GPU Engine counters via ${win.gpuSrc === 'cim' ? 'CIM (Win32_PerfFormattedData_GPUPerformanceCounters_*, any display language)' : 'Get-Counter'} (all engines; per-process; ${win.gpu.length} instances, ~${win.gpuMs} ms per read)`
   }
-  if (nvidiaOk !== false) {
+  if (g && nvidiaOk !== false) {
+    // GPU % already comes from the Windows counters: nvidia-smi only adds power, so refresh it in the background
+    // (at most every 5 s) instead of waiting for it. One nvidia-smi spawn can take seconds when it wakes a sleeping
+    // laptop GPU, which made every sample, and so every session start, that slow.
+    refreshNvidiaPower()
+    if (nvidiaPower.w !== null && Date.now() - nvidiaPower.at < 15_000) g.powerW = nvidiaPower.w
+  } else if (nvidiaOk !== false) {
     try {
       const { stdout } = await run('nvidia-smi', ['--query-gpu=utilization.gpu,utilization.encoder,utilization.decoder,power.draw', '--format=csv,noheader,nounits'], { timeout: 3000, windowsHide: true })
       const n = P.parseNvidiaSmi(stdout)
@@ -831,13 +855,23 @@ let sampleCount = 0
 /** Serialized: a call made while a sample is running waits for it, then takes a fresh one. */
 async function sample() {
   while (inflight) await inflight
+  const t0 = performance.now()
   inflight = takeSample()
   try {
     await inflight
   } finally {
     inflight = null
+    noteSampleMs(performance.now() - t0)
   }
 }
+
+/** How long samples take (the last 40): a slow sampler delays session starts, see PHANTOM_DROP_MS. */
+const sampleMsRing = []
+function noteSampleMs(ms) {
+  sampleMsRing.push(ms)
+  if (sampleMsRing.length > 40) sampleMsRing.shift()
+}
+const slowestSampleMs = () => (sampleMsRing.length ? Math.max(...sampleMsRing) : 0)
 
 let lastSampleAt = null
 
@@ -983,7 +1017,8 @@ function summarize(sess) {
     sampledMs: weights.reduce((a, b) => a + (b ?? 0), 0),
     sampleWindow: sess.sampleEnd ? 'session start → job-end mark' : sess.orphaned ? 'session start → expiry (orphaned)' : 'session start → stop',
     averaging: 'time-weighted by sample interval (p95/max per sample)',
-    overlap: overlapSummary(sess, sess.end ?? Date.now()),
+    // a phantom session (the page gave up on its start and never used it) ran no job: it isn't an overlap
+    overlap: overlapSummary(sess, sess.end ?? Date.now(), (oid) => isPhantomSession(sessions.get(oid), Date.now(), PHANTOM_GRACE_MS)),
     orphaned: sess.orphaned ? { lastSeenMsAgo: Date.now() - sess.lastSeen, timeoutMs: SESSION_TIMEOUT_MS } : null,
     cpuSystemPct: wstat(s.map((x) => x.cpuSystemPct)),
     browserCpuPct: wstat(s.map((x) => x.browserCpuPct)),
@@ -1030,6 +1065,8 @@ function summarize(sess) {
       serverCpuPct, // the bench-server's own JS
       probeCpuPct: childCpu?.avg ?? null, // long-lived probes it started (procstat / PowerShell / powermetrics)
       spawnsPerSample: s.length ? (spawnCount - sess.spawnStart) / s.length : null,
+      sessionStartMs: sess.startMs ?? null, // how long the session start took to answer (the page waits ≤ 15 s)
+      slowestSampleMs: Math.round(slowestSampleMs()), // of the last 40 samples
     },
     cores: os.cpus().length,
     marks: sess.marks,
@@ -1183,8 +1220,18 @@ setInterval(() => {
  * every 500 ms (≥ 1/min even in a throttled background tab), so silence this long means the page is gone.
  */
 const SESSION_TIMEOUT_MS = Math.max(1000, Number(process.env.BENCH_SESSION_TIMEOUT_MS) || 180_000)
+/** A session no request has used this long after its start is a phantom (see isPhantomSession). */
+const PHANTOM_GRACE_MS = Math.max(500, Number(process.env.BENCH_PHANTOM_GRACE_MS) || 2000)
+const PHANTOM_DROP_MS = Math.max(PHANTOM_GRACE_MS, Number(process.env.BENCH_PHANTOM_DROP_MS) || 15_000)
 setInterval(
   () => {
+    for (const id of phantomSessions(sessions, Date.now(), PHANTOM_DROP_MS)) {
+      const sess = sessions.get(id)
+      sessions.delete(id)
+      // it measured no job: forget it on the other side too, so no job is flagged as overlapping it
+      for (const o of [...sessions.values(), ...finished.values()]) o.overlaps.delete(id)
+      console.warn(`⚠ ${sess.meta.kind ?? 'job'} ${id} dropped: the page never used it (its start took ${sess.startMs} ms to answer: did the page stop waiting?). That run has no CPU/GPU numbers.`)
+    }
     for (const id of expiredSessions(sessions, Date.now(), SESSION_TIMEOUT_MS)) {
       const sess = sessions.get(id)
       sess.orphaned = true
@@ -1249,7 +1296,7 @@ const server = http.createServer(async (req, res) => {
     }
   }
   if (req.method === 'GET' && p === '/health') {
-    return send(res, 200, { ok: true, platform: process.platform, startedAt: STARTED_AT, gpuSource, powermetrics: power.ok, intervalMs: INTERVAL, cores: os.cpus().length, cpuModel: os.cpus()[0]?.model ?? '', totalMemGB: os.totalmem() / 1073741824 })
+    return send(res, 200, { ok: true, platform: process.platform, startedAt: STARTED_AT, gpuSource, powermetrics: power.ok, intervalMs: INTERVAL, cores: os.cpus().length, cpuModel: os.cpus()[0]?.model ?? '', totalMemGB: os.totalmem() / 1073741824, slowestSampleMs: Math.round(slowestSampleMs()) })
   }
   if (req.method === 'GET' && p === '/live') return send(res, 200, latest ?? {})
 
@@ -1283,6 +1330,7 @@ const server = http.createServer(async (req, res) => {
 
   // session lifecycle (called by the editor's job runner)
   if (req.method === 'POST' && p === '/sessions') {
+    const requestAt = Date.now()
     const body = await readBody(req)
     const id = String(nextId++)
     const { label, rootPid: _r, pagePort: _pp, ...meta } = body
@@ -1311,7 +1359,7 @@ const server = http.createServer(async (req, res) => {
       backgroundLoad: backgroundLoad(recent), // busiest non-browser processes just before the job
     }
     const now = Date.now()
-    const sess = { label: String(label ?? `job ${id}`), rootPid, attribution, baseline, meta, start: now, lastSeen: now, samples: [], marks: [], mainThread: [], progress: [], overlaps: new Map(), cpuStart: process.cpuUsage(), spawnStart: spawnCount }
+    const sess = { label: String(label ?? `job ${id}`), rootPid, attribution, baseline, meta, start: now, lastSeen: now, samples: [], marks: [], mainThread: [], progress: [], overlaps: new Map(), cpuStart: process.cpuUsage(), spawnStart: spawnCount, startMs: now - requestAt, claimed: false }
     // power source / thermal state: read in the background so the job doesn't wait for it
     sess.conditionsP = runConditions().then((c) => (sess.conditions = c))
     // jobs sampled at the same time share system CPU/GPU numbers: flag them on both sides
@@ -1321,6 +1369,8 @@ const server = http.createServer(async (req, res) => {
       sess.overlaps.set(oid, { label: o.label, rootPid: o.rootPid, from: now, to: null })
     }
     sessions.set(id, sess)
+    // the page waits 15 s for this answer (5 s before 2026-11-23); a slow start is how phantom sessions happen
+    if (sess.startMs > 3000) console.warn(`⚠ session start ${id} took ${sess.startMs} ms to answer (slowest recent sample: ${Math.round(slowestSampleMs())} ms)`)
     if (!QUIET) console.log(`▶ ${meta.kind ?? 'job'} ${id} start: ${label ?? ''} · browser: ${attribution.via}${sess.overlaps.size ? ` · ⚠ overlaps ${sess.overlaps.size} running job(s)` : ''}`)
     return send(res, 200, { id })
   }
@@ -1331,6 +1381,7 @@ const server = http.createServer(async (req, res) => {
     if (!sess) return send(res, 404, { error: 'no such session' })
     const body = await readBody(req)
     if (!sess.end) sess.lastSeen = Date.now()
+    sess.claimed = true // the page knows this session's id, so it is really running a job
     switch (m[2]) {
       case 'mark': {
         const name = String(body.name ?? '')

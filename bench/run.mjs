@@ -472,7 +472,12 @@ async function runBrowser(spec, info, { appUrl, serverOk, stamp, allReports, row
       // capabilities at THIS scenario's output size (a 4K encode may be unsupported where 1080p works)
       const [w, h] = [sc.settings.width ?? sc.projectSize?.[0] ?? 1920, sc.settings.height ?? sc.projectSize?.[1] ?? 1080]
       const scCaps = await page.evaluate((q) => window.__nleBench.capabilities(q), { width: w, height: h, fps: sc.settings.fps ?? 30 })
-      const why = supported(scCaps, sc.settings)
+      let why = supported(scCaps, sc.settings)
+      // a hardware preference narrows it further: no hardware encoder (Linux, Firefox) means skip, not fail
+      if (!why && sc.settings.videoCodec && sc.settings.hardwareAcceleration && sc.settings.hardwareAcceleration !== 'no-preference') {
+        const ok = await page.evaluate(({ patch, q }) => window.__nleBench.canEncodeVideoAs(patch, q), { patch: sc.settings, q: { width: w, height: h, fps: sc.settings.fps ?? 30 } }).catch(() => true)
+        if (!ok) why = `no ${sc.settings.hardwareAcceleration === 'prefer-hardware' ? 'hardware' : 'software'} ${sc.settings.videoCodec} encoder at ${w}×${h} in this browser`
+      }
       if (why) {
         blog(`skip ${sc.id}: ${why}`)
         summary.push({ ...who, scenario: sc.id, status: `skipped (${why})`, skipped: true, reason: why })

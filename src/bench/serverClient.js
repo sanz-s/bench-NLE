@@ -40,11 +40,13 @@ export function serverHealth() {
 
 export async function startSession(label, meta) {
   // pagePort: fallback for finding this browser's processes when the request doesn't come through the Vite bridge.
-  // Longer timeout: the server looks the browser up with lsof before answering.
+  // Longer timeout: the server looks the browser up (lsof / Get-NetTCPConnection) and takes a baseline sample before
+  // answering, which took > 5 s on a loaded Windows laptop. If we give up anyway, the server drops the unused session
+  // after 15 s (a "phantom") so it can't be counted as an overlapping job.
   const r = await call(
     '/sessions',
     { method: 'POST', body: JSON.stringify({ label, rootPid, pagePort: Number(location.port) || null, source: automated ? 'playwright' : 'editor', ...meta }) },
-    5000,
+    15000,
   )
   return r?.id ?? null
 }

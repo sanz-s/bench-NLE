@@ -142,7 +142,8 @@ function fileNameFor(base, s) {
   return `${clean}${containerDef(s.container).ext}`
 }
 
-function videoBitrate(s) {
+/** Bitrate or Quality the video encoder is given (also used by the bench's capability check, so both agree). */
+export function videoBitrate(s) {
   return s.qualityMode === 'bitrate' ? s.videoBitrate : QUALITY[s.quality]
 }
 function audioBitrate(s) {

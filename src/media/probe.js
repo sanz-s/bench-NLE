@@ -141,26 +141,56 @@ export async function probeFile(file) {
  *  - full: every video frame and audio sample (slow on long files; `--matrix` and opt-in only). Returns the decoded
  *    frame count and audio duration so the caller can compare them with what was expected.
  */
+/**
+ * Decode the first frames (+ last frame) of a video track. Throws on a decoder error.
+ * @returns {Promise<{frames: number, problems: string[]}>}
+ */
+async function decodeVideo(v, full, decoderOptions) {
+  const problems = []
+  const sink = new CanvasSink(v, { width: 64, height: 36, fit: 'fill', decoderOptions })
+  let frames = 0
+  for await (const _ of sink.canvases()) {
+    if (++frames >= 3 && !full) break
+  }
+  if (!frames) problems.push('no video frame could be decoded')
+  if (!full) {
+    const end = await v.computeDuration()
+    const last = end > 0 ? await sink.getCanvas(Math.max(0, end - 1e-3)) : null
+    if (!last) problems.push(`the last video frame (at ${end.toFixed(3)} s) could not be decoded`)
+  }
+  return { frames, problems }
+}
+
+const errText = (err) => (err instanceof Error ? err.message : String(err))
+
 export async function decodeCheck(file, { full = false } = {}) {
   const problems = []
-  const out = { depth: full ? 'full' : 'head+tail', videoFrames: null, audioSeconds: null }
+  const out = { depth: full ? 'full' : 'head+tail', videoFrames: null, audioSeconds: null, videoDecoder: null }
   const input = openInput(file)
   try {
     const v = await input.getPrimaryVideoTrack()
     if (v) {
       if (!(await v.canDecode())) problems.push(`video ${v.codec ?? '?'} is not decodable`)
       else {
-        const sink = new CanvasSink(v, { width: 64, height: 36, fit: 'fill' })
-        let frames = 0
-        for await (const _ of sink.canvases()) {
-          if (++frames >= 3 && !full) break
+        // The browser's default decoder may be a hardware one that fails on a file its software decoder reads fine
+        // (seen: AV1 on Linux, where VA-API decoders are used). Retry in software before calling the FILE broken,
+        // and record which decoder read it.
+        let r = null
+        try {
+          r = await decodeVideo(v, full)
+          out.videoDecoder = 'default'
+        } catch (err) {
+          const first = errText(err)
+          try {
+            r = await decodeVideo(v, full, { hardwareAcceleration: 'prefer-software' })
+            out.videoDecoder = `software (the default decoder failed: ${first})`
+          } catch (err2) {
+            problems.push(`decode failed: ${first}${errText(err2) !== first ? `; software decoder: ${errText(err2)}` : ' (software decoder too)'}`)
+          }
         }
-        if (!frames) problems.push('no video frame could be decoded')
-        if (full) out.videoFrames = frames
-        else {
-          const end = await v.computeDuration()
-          const last = end > 0 ? await sink.getCanvas(Math.max(0, end - 1e-3)) : null
-          if (!last) problems.push(`the last video frame (at ${end.toFixed(3)} s) could not be decoded`)
+        if (r) {
+          problems.push(...r.problems)
+          if (full) out.videoFrames = r.frames
         }
       }
     }
@@ -192,7 +222,7 @@ export async function decodeCheck(file, { full = false } = {}) {
       }
     }
   } catch (err) {
-    problems.push(`decode failed: ${err instanceof Error ? err.message : String(err)}`)
+    problems.push(`decode failed: ${errText(err)}`)
   } finally {
     input.dispose()
   }

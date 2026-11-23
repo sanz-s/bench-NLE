@@ -32,6 +32,9 @@ export function mdTable(cols, rows) {
 const mb = (bytes) => (typeof bytes === 'number' ? +(bytes / 1048576).toFixed(2) : null)
 const ms = (v) => (typeof v === 'number' ? Math.round(v) : v)
 
+/** "yes (software decode)" when only the software decoder could read the output (the default one failed) */
+const verifiedCell = (v, row) => (v === true && /^software/.test(row?.verifyDecoder ?? '') ? 'yes (software decode)' : v)
+
 const SPEED_COLS = [
   { key: 'scenario', title: 'Scenario' },
   { key: 'passedRuns', title: 'Passed' },
@@ -42,7 +45,7 @@ const SPEED_COLS = [
   { key: 'realtimeX', title: '× realtime', num: true },
   { key: 'pipelineFps', title: 'fps', num: true },
   { key: 'outBytes', title: 'Size MB', num: true, fmt: mb },
-  { key: 'verified', title: 'Verified' },
+  { key: 'verified', title: 'Verified', fmt: verifiedCell },
 ]
 
 const LOAD_COLS = [
@@ -65,7 +68,7 @@ const RUN_COLS = [
   { key: 'scenario', title: 'Scenario' },
   { key: 'run', title: 'Run', num: true },
   { key: 'status', title: 'Status' },
-  { key: 'verified', title: 'Verified' },
+  { key: 'verified', title: 'Verified', fmt: verifiedCell },
   { key: 'conversionMs', title: 'Total ms', num: true },
   { key: 'encodeWaitMs', title: 'Encode wait ms', num: true, fmt: (v) => v ?? 'pipelined' },
   { key: 'realtimeX', title: '× realtime', num: true },
@@ -78,7 +81,7 @@ const RUN_COLS = [
 const MATRIX_COLS = [
   { key: 'combo', title: 'Container / video / audio' },
   { key: 'status', title: 'Status' },
-  { key: 'verified', title: 'Verified' },
+  { key: 'verified', title: 'Verified', fmt: verifiedCell },
   { key: 'ms', title: 'Total ms', num: true },
   { key: 'problem', title: 'Problem' },
 ]
@@ -89,7 +92,7 @@ const LEGEND = [
   ['Encode wait ms', 'time spent waiting on the encoder queue plus the final flush; "pipelined" for Mediabunny Conversion jobs, where it can’t be separated'],
   ['× realtime', 'media duration ÷ job time (2 = twice as fast as playback)'],
   ['fps', 'output frames ÷ job time'],
-  ['Verified', 'the output was re-opened and decoded, and its tracks, codecs, size, fps and durations matched the request'],
+  ['Verified', 'the output was re-opened and decoded, and its tracks, codecs, size, fps and durations matched the request. "yes (software decode)": the browser\'s default (often hardware) video decoder failed on it and its software decoder read it fine, so the file is good but that decoder is not'],
   ['TBT ms', 'total blocking time on the page’s main thread (sum of long-task time over 50 ms)'],
   ['Longest task ms', 'longest single main-thread task during the job'],
   ['Main-thread ms', 'Chrome’s own main-thread task time for the job (CDP), the clearest worker vs main-thread comparison'],

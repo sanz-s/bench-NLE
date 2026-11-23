@@ -95,6 +95,7 @@ export function flattenReport(r) {
     overlappingJobs: r.system?.overlap?.sessions?.length ?? null,
     verified: r.verify?.ok ?? null,
     verifyProblems: r.verify?.problems.join(' | ') ?? null,
+    verifyDecoder: r.verify?.videoDecoder ?? null,
     error: r.error ?? null,
   }
   if (r.cdp) for (const [k, v] of Object.entries(r.cdp)) row[`cdp_${k}`] = typeof v === 'number' ? round(v, 1) : v

@@ -1,6 +1,6 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { expiredSessions, overlapSummary, stat } from './stats.mjs'
+import { expiredSessions, isPhantomSession, overlapSummary, phantomSessions, stat } from './stats.mjs'
 
 test('stat: unweighted when no weights are given', () => {
   assert.deepEqual(stat([10, 20, 30]), { avg: 20, p95: 30, max: 30 })
@@ -55,4 +55,21 @@ test('expiredSessions: only running sessions silent for longer than the timeout'
     ['no-lastSeen', { start: 1_000 }],
   ])
   assert.deepEqual(expiredSessions(sessions, now, 60_000), ['quiet', 'no-lastSeen'])
+})
+
+test('phantom sessions: never used by the page are dropped and never count as an overlap', () => {
+  const now = 100_000
+  const sessions = new Map([
+    ['phantom', { start: 80_000 }], // the page gave up waiting for the start answer and never called back
+    ['young', { start: 99_500 }], // just started: the page hasn't sent job-start yet
+    ['real', { start: 80_000, claimed: true }],
+    ['stopped', { start: 0, end: 5_000 }],
+  ])
+  assert.deepEqual(phantomSessions(sessions, now, 15_000), ['phantom'])
+  assert.equal(isPhantomSession(sessions.get('young'), now, 2_000), false)
+  assert.equal(isPhantomSession(undefined, now, 2_000), false)
+  const sess = { rootPid: 1, overlaps: new Map([['phantom', { label: 'p', rootPid: 1, from: 90_000, to: null }]]) }
+  assert.equal(overlapSummary(sess, now, (id) => isPhantomSession(sessions.get(id), now, 2_000)), null)
+  sess.overlaps.set('real', { label: 'r', rootPid: 1, from: 90_000, to: null })
+  assert.deepEqual(overlapSummary(sess, now, (id) => isPhantomSession(sessions.get(id), now, 2_000)).sessions.map((x) => x.id), ['real'])
 })

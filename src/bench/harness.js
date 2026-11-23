@@ -2,7 +2,10 @@
  * window.__nleBench — automation API used by the Playwright runner (bench/run.mjs).
  * Everything goes through the same code paths as the UI.
  */
+import { canEncodeVideo } from 'mediabunny'
 import { getCapabilities } from '../media/capabilities'
+import { registerAllExtensions } from '../media/extensions'
+import { videoBitrate } from '../media/jobs'
 import { generateTestClip, importFiles, startConvert, startExport } from '../editor/actions'
 import { getState, replaceProject, setState, setTime } from '../editor/store'
 import { defaultEncodeSettings, defaultProject, makeClip, newTrack, videoTracks, audioTracks } from '../editor/model'
@@ -63,6 +66,18 @@ const api = {
   async capabilities(q) {
     const p = getState().project
     return getCapabilities({ width: p.width, height: p.height, fps: p.fps, channels: 2, sampleRate: 48000, ...q })
+  },
+
+  /**
+   * Can this browser encode the scenario's video with its exact encoder options (hardware preference included)?
+   * The capability matrix asks without a preference, so a browser with no hardware H.264 encoder still lists H.264;
+   * this catches `hardwareAcceleration: 'prefer-hardware'` scenarios before they fail (Linux, Firefox).
+   */
+  async canEncodeVideoAs(patch, q) {
+    registerAllExtensions()
+    const s = settingsFor(defaultEncodeSettings(getState().project), patch)
+    if (!s.videoCodec) return true
+    return canEncodeVideo(s.videoCodec, { width: q.width, height: q.height, frameRate: q.fps, bitrate: videoBitrate(s), hardwareAcceleration: s.hardwareAcceleration })
   },
 
   serverHealth,

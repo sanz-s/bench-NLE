@@ -44,7 +44,8 @@ function benchApiBridge() {
           // The browser's socket ports let the bench-server find WHICH browser process made this request (lsof).
           headers: { 'content-type': 'application/json', 'x-bench-peer-port': String(req.socket.remotePort ?? ''), 'x-bench-page-port': String(req.socket.localPort ?? '') },
           body: req.method === 'GET' || req.method === 'HEAD' ? undefined : Buffer.concat(chunks),
-          signal: AbortSignal.timeout(5000),
+          // longer than the page's longest wait (session start: 15 s), so the page decides when to give up
+          signal: AbortSignal.timeout(20000),
         })
         res.statusCode = r.status
         res.setHeader('content-type', r.headers.get('content-type') ?? 'application/json')

@@ -151,6 +151,8 @@ export async function verifyOutput(file, job, expectedDuration, expect = {}) {
       ok: problems.length === 0,
       problems,
       depth: dec.depth,
+      // 'default', or 'software (the default decoder failed: …)' when only the software decoder could read it
+      videoDecoder: dec.videoDecoder,
       container: info.container,
       mimeType: info.mimeType,
       videoCodec: info.video?.codec ?? null,
