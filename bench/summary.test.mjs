@@ -161,3 +161,28 @@ test('report: an output only the software decoder could read is marked "yes (sof
   assert.match(md.split('## Every run')[1], /yes \(software decode\)/)
   assert.match(md, /PASSED/)
 })
+
+test('report: a browser that failed partway still gets its section and comparison column (Windows Firefox, 2026-11-24)', () => {
+  const run = (browser, scenario, ms) => ({ browser, scenario, run: 1, status: 'done', verified: true, conversionMs: ms })
+  const lostRow = { browser: 'firefox', scenario: 'exp', run: 1, status: 'error', verified: null, error: 'page lost during this scenario: the tab crashed' }
+  const md = markdownReport({
+    title: 'T',
+    env: {},
+    mode: 'scenarios',
+    browsers: [
+      { key: 'chrome', name: 'Google Chrome', engine: 'Blink', status: 'ran', version: '1' },
+      { key: 'firefox', name: 'Firefox (Playwright build)', engine: 'Gecko', status: 'failed', version: '2', note: 'the page was lost 3 times' },
+    ],
+    rows: [run('chrome', 'conv', 100), run('chrome', 'exp', 200), run('firefox', 'conv', 300), lostRow],
+    summary: [
+      { browser: 'chrome', scenario: 'conv', passedRuns: '1/1', median: run('chrome', 'conv', 100) },
+      { browser: 'chrome', scenario: 'exp', passedRuns: '1/1', median: run('chrome', 'exp', 200) },
+      { browser: 'chrome', scenario: 'late', passedRuns: '1/1', median: run('chrome', 'late', 50) },
+      { browser: 'firefox', scenario: 'conv', passedRuns: '1/1', median: run('firefox', 'conv', 300) },
+      { browser: 'firefox', scenario: 'exp', failedAll: true, passedRuns: '0/1', error: lostRow.error },
+    ],
+  })
+  assert.match(md, /\*\*Result: FAILED[^\n]*could not run[^\n]*· 2 browser\(s\)/)
+  assert.match(md, /## Engines side by side[\s\S]*\| conv +\| +100 \| +300 \|[\s\S]*\| late +\| +50 \| +not run \|/)
+  assert.match(md, /## Firefox \(Playwright build\) · Gecko engine \(stopped early: the page was lost 3 times\)[\s\S]*### Speed[\s\S]*### Scenarios with no passing run[\s\S]*the tab crashed/)
+})

@@ -125,18 +125,23 @@ const BROWSER_COLS = [
 
 /** One column per browser that ran: the median Total ms, or why there is none. */
 function comparisonTable(browsers, summary) {
-  const ran = browsers.filter((b) => b.status === 'ran')
+  const ran = withResults(browsers, summary)
   const scenarios = [...new Set(summary.map((s) => s.scenario))]
   const cols = [{ key: 'scenario', title: 'Scenario' }, ...ran.map((b) => ({ key: b.key, title: `${b.name.split(' (')[0]} ms`, num: true }))]
   const data = scenarios.map((sc) => {
     const row = { scenario: sc }
     for (const b of ran) {
       const e = summary.find((s) => s.browser === b.key && s.scenario === sc)
-      row[b.key] = !e ? null : e.median ? e.median.conversionMs : e.skipped ? 'skipped' : 'FAILED'
+      row[b.key] = !e ? (b.status === 'failed' ? 'not run' : null) : e.median ? e.median.conversionMs : e.skipped ? 'skipped' : 'FAILED'
     }
     return row
   })
   return mdTable(cols, data)
+}
+
+/** Browsers to give a section: every one that ran, plus one that failed partway but has results. */
+function withResults(browsers, summary) {
+  return browsers.filter((b) => b.status === 'ran' || (b.status === 'failed' && summary.some((s) => s.browser === b.key)))
 }
 
 /**
@@ -159,7 +164,8 @@ export function markdownReport({ title, env, browsers = [], mode, summary, rows,
   const brokenBrowsers = browsers.filter((b) => b.status === 'failed')
   const skippedBrowsers = browsers.filter((b) => b.status === 'skipped' && !b.platformSkip)
   const forBrowser = (b) => summary.filter((s) => (s.browser ?? null) === (b?.key ?? null))
-  const groups = browsers.length ? ran : [null] // reports without browser info: one unnamed group
+  const shown = withResults(browsers, summary)
+  const groups = browsers.length ? shown : [null] // reports without browser info: one unnamed group
   const browserNote = [brokenBrowsers.length && `${brokenBrowsers.length} browser(s) failed to run`, skippedBrowsers.length && `${skippedBrowsers.length} browser(s) not installed`].filter(Boolean).join(' · ')
 
   if (mode === 'matrix') {
@@ -179,14 +185,14 @@ export function markdownReport({ title, env, browsers = [], mode, summary, rows,
       failed.length || brokenBrowsers.length || (browsers.length && !ran.length)
         ? `FAILED (${[failed.length && `${failed.length} of ${runRows.length} runs failed`, brokenBrowsers.length && `${brokenBrowsers.map((b) => b.name).join(', ')} could not run`, browsers.length && !ran.length && 'no browser ran'].filter(Boolean).join('; ')})`
         : `PASSED (${runRows.length} of ${runRows.length} runs verified)`
-    out.push(`**Result: ${verdict}** · ${ran.length || 1} browser(s) · ${new Set([...medians, ...noPass].map((s) => s.scenario)).size} scenario(s) run · ${skipped.length} skipped${skippedBrowsers.length ? ` · ${skippedBrowsers.length} browser(s) not installed` : ''}`, '')
+    out.push(`**Result: ${verdict}** · ${shown.length || 1} browser(s) · ${new Set([...medians, ...noPass].map((s) => s.scenario)).size} scenario(s) run · ${skipped.length} skipped${skippedBrowsers.length ? ` · ${skippedBrowsers.length} browser(s) not installed` : ''}`, '')
     out.push('## Setup', '', setupTable(env), '')
     if (browsers.length) out.push('## Browsers', '', mdTable(BROWSER_COLS, browsers), '')
-    if (ran.length > 1 && summary.length) out.push('## Engines side by side (median Total ms, lower is faster)', '', comparisonTable(browsers, summary), '')
+    if (shown.length > 1 && summary.length) out.push('## Engines side by side (median Total ms, lower is faster)', '', comparisonTable(browsers, summary), '')
 
     for (const b of groups) {
       const mine = forBrowser(b)
-      const h = b ? `## ${b.name} · ${b.engine} engine` : null
+      const h = b ? `## ${b.name} · ${b.engine} engine${b.status === 'failed' ? ` (stopped early: ${b.note || 'see the Browsers table'})` : ''}` : null
       const sub = b ? '###' : '##'
       if (h) out.push(h, '')
       const med = mine.filter((s) => s.median).map((s) => ({ ...s.median, scenario: s.scenario, passedRuns: s.passedRuns }))

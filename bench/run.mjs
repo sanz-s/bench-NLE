@@ -28,7 +28,7 @@
  *   server   CPU / GPU / browser-process CPU from `npm run bench:server` (if running), filtered to this browser's PID tree
  */
 import * as pw from 'playwright'
-import { spawn } from 'node:child_process'
+import { execFileSync, spawn } from 'node:child_process'
 import { existsSync, mkdirSync, rmSync, writeFileSync } from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
@@ -64,6 +64,8 @@ const MATRIX = has('matrix') || MATRIX_ALL
 // full-file decode in the verifier (every frame/sample): on for --matrix, opt-in otherwise (slow on long outputs)
 const FULL_VERIFY = has('full-verify') || (MATRIX && !has('quick-verify'))
 const SERVER = val('server', 'http://127.0.0.1:5199')
+// a lost page (tab crash, navigation) is reopened this many times per browser before the browser counts as failed
+const MAX_PAGE_RECOVERIES = 2
 // AAC encoder under test: auto (native when the browser has it) | native (WebCodecs) | wasm (@mediabunny/aac-encoder)
 const AAC = val('aac', 'auto')
 // the folder the user ran npm from (npm itself switches to the package root)
@@ -245,6 +247,8 @@ async function main() {
     CPU: `${os.cpus()[0]?.model?.trim() ?? 'unknown'} × ${os.cpus().length} threads`,
     RAM: `${Math.round(os.totalmem() / 1073741824)} GB`,
     Node: process.version,
+    // which code produced this report (a laptop on an old checkout looks like a regression)
+    Code: codeVersion(),
     'Browser mode': HEADLESS ? 'headless (GPU numbers may be software)' : 'headed (real GPU and hardware encoders)',
     'Bench-server (CPU/GPU)': serverOk ? `online at ${SERVER}` : 'offline: CPU/GPU columns are empty',
     // where the GPU numbers come from, or why there are none (from the bench-server's method notes)
@@ -298,6 +302,19 @@ async function main() {
   process.exitCode = failedBrowsers.length || !browsersRun.some((b) => b.status === 'ran') ? 1 : exitCode(runRows, { skipped, failOnSkip: has('fail-on-skip') })
 }
 
+/** The git commit (and branch) this run used, with a note if tracked files were changed; null without git. */
+function codeVersion() {
+  const git = (...args) => execFileSync('git', args, { cwd: root, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], timeout: 5000 }).trim()
+  try {
+    const commit = git('log', '-1', '--format=%h %cs %s')
+    const branch = git('rev-parse', '--abbrev-ref', 'HEAD')
+    const dirty = git('status', '--porcelain', '--untracked-files=no')
+    return `${commit} (branch ${branch})${dirty ? ', with uncommitted changes' : ''}`
+  } catch {
+    return null
+  }
+}
+
 /** Everything for one browser: launch, open the app, fixtures, scenarios (or the matrix), close. */
 async function runBrowser(spec, info, { appUrl, serverOk, stamp, allReports, rows, summary, fixtureDir, fixtureFiles }) {
   const type = pw[spec.type]
@@ -324,40 +341,96 @@ async function runBrowser(spec, info, { appUrl, serverOk, stamp, allReports, row
     info.pid = browserPid
     blog(`${spec.name} ${browser.version()} pid ${browserPid}${HEADLESS ? ' (headless: GPU numbers may be software)' : ''}`)
     const context = await browser.newContext({ viewport: { width: 1440, height: 900 }, acceptDownloads: false })
-    const page = await context.newPage()
-    page.on('console', (m) => m.type() === 'error' && console.error(`[page ${tag}] ${m.text()}`))
-    page.on('pageerror', (e) => console.error(`[page error ${tag}] ${e.message}`))
-    await page.goto(`${appUrl}/?bench=1`)
-    try {
-      await page.waitForFunction(() => window.__nleBench?.ready === true, null, { timeout: 30000 })
-    } catch {
-      // one reload: a transient bad first load (seen once: an HTTP 429 challenge page from outside this project)
-      blog('app not ready after 30 s; reloading once')
-      await page.reload()
-      await page.waitForFunction(() => window.__nleBench?.ready === true, null, { timeout: 30000 })
-    }
-    const isolated = await page.evaluate(() => crossOriginIsolated)
-    info.isolated = isolated
-    if (!isolated) blog('WARNING: page is not cross-origin isolated; extension WASM will use slower threading')
-    await page.evaluate((pid) => window.__nleBench.setRootPid(pid), browserPid)
-    await page.evaluate((on) => (on ? localStorage.setItem('bench.fullVerify', '1') : localStorage.removeItem('bench.fullVerify')), FULL_VERIFY)
-    await page.evaluate((m) => localStorage.setItem('bench.aacEncoder', m), AAC)
-    const selfTest = await page.evaluate(() => window.__nleBench.selfTestMainThread())
-    blog(
-      selfTest.longTaskSupported
-        ? `main-thread probe self-test (3 × 120 ms injected): ${selfTest.longTasks} long tasks, TBT ${Math.round(selfTest.tbtMs)} ms, longest ${Math.round(selfTest.longestTaskMs)} ms`
-        : 'no Long Tasks API in this browser: TBT and longest task are not measured (frame gaps are)',
-    )
-    // CDP (main-thread task time) and Chrome tracing exist only in Chromium
-    const cdp = isChromium ? await context.newCDPSession(page) : null
-    if (cdp) await cdp.send('Performance.enable', { timeDomain: 'timeTicks' })
-    if (TRACE && !isChromium) blog('--trace is Chromium-only: no trace for this browser')
-    // jobRunner calls this right before and right after the job; the page waits while we snapshot
+    // jobRunner calls this right before and right after the job; the page waits while we snapshot. Exposed on the
+    // context, so a page opened after a lost one has it too. It also says which server session the job uses.
     let gateSnaps = {}
-    await page.exposeFunction('__nleBenchGate', async (name) => {
+    let page = null
+    let cdp = null
+    let lost = null // why the current page stopped being usable (crash / navigation), set by its event handlers
+    let jobSession = null // the running job's bench-server session, ended by recoverPage if the page dies
+    let recoveries = 0
+    const lostCauses = []
+    await context.exposeFunction('__nleBenchGate', async (name, sessionId) => {
+      if (name === 'job-start') jobSession = sessionId ?? null
       if (cdp) gateSnaps[name] = await cdpMetrics(cdp)
     })
+    if (TRACE && !isChromium) blog('--trace is Chromium-only: no trace for this browser')
 
+    /** Open the app in a new tab and get it ready for jobs (first start, and after a page was lost). */
+    async function openApp(first) {
+      const p = await context.newPage()
+      page = p
+      lost = null
+      p.on('console', (m) => m.type() === 'error' && console.error(`[page ${tag}] ${m.text()}`))
+      p.on('pageerror', (e) => console.error(`[page error ${tag}] ${e.message}`))
+      p.on('crash', () => {
+        lost ??= 'the tab crashed (its content process died)'
+        blog('the page crashed')
+      })
+      p.on('framenavigated', (f) => {
+        if (f !== p.mainFrame() || f.url().startsWith(appUrl)) return
+        lost ??= `the page navigated away to ${f.url()}` // e.g. Firefox's about:tabcrashed
+        blog(`the page navigated away to ${f.url()}`)
+      })
+      await p.goto(`${appUrl}/?bench=1`)
+      try {
+        await p.waitForFunction(() => window.__nleBench?.ready === true, null, { timeout: 30000 })
+      } catch {
+        // one reload: a transient bad first load (seen once: an HTTP 429 challenge page from outside this project)
+        blog('app not ready after 30 s; reloading once')
+        await p.reload()
+        await p.waitForFunction(() => window.__nleBench?.ready === true, null, { timeout: 30000 })
+      }
+      const isolated = await p.evaluate(() => crossOriginIsolated)
+      info.isolated = isolated
+      if (!isolated) blog('WARNING: page is not cross-origin isolated; extension WASM will use slower threading')
+      await p.evaluate((pid) => window.__nleBench.setRootPid(pid), browserPid)
+      await p.evaluate((on) => (on ? localStorage.setItem('bench.fullVerify', '1') : localStorage.removeItem('bench.fullVerify')), FULL_VERIFY)
+      await p.evaluate((m) => localStorage.setItem('bench.aacEncoder', m), AAC)
+      if (first) {
+        const selfTest = await p.evaluate(() => window.__nleBench.selfTestMainThread())
+        blog(
+          selfTest.longTaskSupported
+            ? `main-thread probe self-test (3 × 120 ms injected): ${selfTest.longTasks} long tasks, TBT ${Math.round(selfTest.tbtMs)} ms, longest ${Math.round(selfTest.longestTaskMs)} ms`
+            : 'no Long Tasks API in this browser: TBT and longest task are not measured (frame gaps are)',
+        )
+      }
+      // CDP (main-thread task time) and Chrome tracing exist only in Chromium
+      cdp = isChromium ? await context.newCDPSession(p) : null
+      if (cdp) await cdp.send('Performance.enable', { timeDomain: 'timeTicks' })
+    }
+
+    /** After a scenario threw: why the page is no longer usable, or null if it is fine (an ordinary job error). */
+    async function pageLostReason(err) {
+      // the crash / navigation event can arrive just after the evaluate rejects: give it a moment to name the cause
+      if (!lost) await new Promise((r) => setTimeout(r, 1000))
+      if (lost) return lost
+      if (page.isClosed()) return 'the page was closed'
+      const msg = err?.message ?? ''
+      if (/Execution context was destroyed|Target crashed|Target page, context or browser has been closed/i.test(msg)) return lost ?? 'the page navigated or reloaded during the job'
+      const alive = await Promise.race([page.evaluate(() => window.__nleBench?.ready === true).catch(() => false), new Promise((r) => setTimeout(() => r(false), 5000))])
+      return alive ? null : `the app is gone from the page (now at ${page.url()})`
+    }
+
+    /** End the dead job's server session (it would flag the next runs as overlapping), then reopen the app. */
+    async function recoverPage(why) {
+      lostCauses.push(why)
+      if (jobSession && serverOk) {
+        await fetch(`${SERVER}/sessions/${jobSession}/stop`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: '{}', signal: AbortSignal.timeout(10000) }).catch(() => {})
+      }
+      jobSession = null
+      if (++recoveries > MAX_PAGE_RECOVERIES) throw new Error(`the page was lost ${recoveries} times (first: ${lostCauses[0]}; last: ${why})`)
+      blog(`page lost (${why}); opening the app in a new tab (${recoveries}/${MAX_PAGE_RECOVERIES}) and going on with the next scenario`)
+      const old = page
+      await old.close().catch(() => {})
+      // assets live in the page: re-import the fixtures into the new one
+      for (const k of Object.keys(fixtureIds)) delete fixtureIds[k]
+      await openApp(false)
+      info.recovered = recoveries
+      info.note = `page lost ${recoveries}× and reopened (${lostCauses.join('; ')}); scenarios after it ran in a new tab`
+    }
+
+    await openApp(true)
     const caps = await page.evaluate(() => window.__nleBench.capabilities())
 
     // fixtures: real files from bench/fixtures/, or generated once (first browser) and shared with the others
@@ -423,6 +496,7 @@ async function runBrowser(spec, info, { appUrl, serverOk, stamp, allReports, row
       }
       report.browser = { key: spec.key, name: spec.name, engine: spec.engine, version: info.version }
       const row = await page.evaluate((r) => window.__nleBench.flatten(r), report)
+      jobSession = null // the job stopped its own session
       return { report, row: { ...who, scenario: sc.id, run: runIndex + 1, ...row } }
     }
 
@@ -451,10 +525,15 @@ async function runBrowser(spec, info, { appUrl, serverOk, stamp, allReports, row
         try {
           ;({ report, row } = await runOne(sc, 0))
         } catch (err) {
-          const msg = err.message.split('\n')[0]
+          const lostWhy = await pageLostReason(err)
+          const msg = lostWhy ? `page lost during this combination: ${lostWhy}` : err.message.split('\n')[0]
           rows.push({ ...who, scenario: sc.id, run: 1, status: 'error', verified: null, error: msg })
           summary.push({ ...who, combo: k, status: 'error', verified: null, ms: null, problem: msg })
           blog(`${k}: error · ${msg}`)
+          if (lostWhy) {
+            await recoverPage(lostWhy)
+            await fixture(key)
+          }
           continue
         }
         allReports.push(report)
@@ -469,22 +548,23 @@ async function runBrowser(spec, info, { appUrl, serverOk, stamp, allReports, row
     const list = SCENARIOS.filter((s) => !ONLY || ONLY.includes(s.id))
     if (!list.length) throw new Error(`no scenario matches ${ONLY}. Available: ${SCENARIOS.map((s) => s.id).join(', ')}`)
     for (const sc of list) {
-      // capabilities at THIS scenario's output size (a 4K encode may be unsupported where 1080p works)
-      const [w, h] = [sc.settings.width ?? sc.projectSize?.[0] ?? 1920, sc.settings.height ?? sc.projectSize?.[1] ?? 1080]
-      const scCaps = await page.evaluate((q) => window.__nleBench.capabilities(q), { width: w, height: h, fps: sc.settings.fps ?? 30 })
-      let why = supported(scCaps, sc.settings)
-      // a hardware preference narrows it further: no hardware encoder (Linux, Firefox) means skip, not fail
-      if (!why && sc.settings.videoCodec && sc.settings.hardwareAcceleration && sc.settings.hardwareAcceleration !== 'no-preference') {
-        const ok = await page.evaluate(({ patch, q }) => window.__nleBench.canEncodeVideoAs(patch, q), { patch: sc.settings, q: { width: w, height: h, fps: sc.settings.fps ?? 30 } }).catch(() => true)
-        if (!ok) why = `no ${sc.settings.hardwareAcceleration === 'prefer-hardware' ? 'hardware' : 'software'} ${sc.settings.videoCodec} encoder at ${w}×${h} in this browser`
-      }
-      if (why) {
-        blog(`skip ${sc.id}: ${why}`)
-        summary.push({ ...who, scenario: sc.id, status: `skipped (${why})`, skipped: true, reason: why })
-        continue
-      }
       const scRows = []
+      let lostWhy = null
       try {
+        // capabilities at THIS scenario's output size (a 4K encode may be unsupported where 1080p works)
+        const [w, h] = [sc.settings.width ?? sc.projectSize?.[0] ?? 1920, sc.settings.height ?? sc.projectSize?.[1] ?? 1080]
+        const scCaps = await page.evaluate((q) => window.__nleBench.capabilities(q), { width: w, height: h, fps: sc.settings.fps ?? 30 })
+        let why = supported(scCaps, sc.settings)
+        // a hardware preference narrows it further: no hardware encoder (Linux, Firefox) means skip, not fail
+        if (!why && sc.settings.videoCodec && sc.settings.hardwareAcceleration && sc.settings.hardwareAcceleration !== 'no-preference') {
+          const ok = await page.evaluate(({ patch, q }) => window.__nleBench.canEncodeVideoAs(patch, q), { patch: sc.settings, q: { width: w, height: h, fps: sc.settings.fps ?? 30 } }).catch(() => true)
+          if (!ok) why = `no ${sc.settings.hardwareAcceleration === 'prefer-hardware' ? 'hardware' : 'software'} ${sc.settings.videoCodec} encoder at ${w}×${h} in this browser`
+        }
+        if (why) {
+          blog(`skip ${sc.id}: ${why}`)
+          summary.push({ ...who, scenario: sc.id, status: `skipped (${why})`, skipped: true, reason: why })
+          continue
+        }
         for (let i = 0; i < WARMUP; i++) {
           const { report } = await runOne(sc, -1 - i)
           allReports.push({ ...report, warmup: true })
@@ -502,9 +582,10 @@ async function runBrowser(spec, info, { appUrl, serverOk, stamp, allReports, row
           )
         }
       } catch (err) {
-        // one scenario that throws (import timeout, page error) fails that scenario, not the whole browser
-        const msg = err.message.split('\n')[0]
-        blog(`${sc.id}: ${msg}`)
+        // one scenario that throws (import timeout, page error, lost page) fails that scenario, not the whole browser
+        lostWhy = await pageLostReason(err)
+        const msg = lostWhy ? `page lost during this scenario: ${lostWhy}` : err.message.split('\n')[0]
+        blog(`${sc.id}: ${msg}${lostWhy ? ` (${err.message.split('\n')[0]})` : ''}`)
         const row = { ...who, scenario: sc.id, run: scRows.length + 1, status: 'error', verified: null, error: msg }
         rows.push(row)
         scRows.push(row)
@@ -517,6 +598,8 @@ async function runBrowser(spec, info, { appUrl, serverOk, stamp, allReports, row
         rows.push(m)
         summary.push({ ...who, scenario: sc.id, status: sum.failed ? 'some runs failed' : 'passed', passedRuns: `${sum.passed}/${sum.runs}`, medianOfRun: m.medianOfRun, median: m })
       } else summary.push({ ...who, scenario: sc.id, status: 'FAILED', failedAll: true, passedRuns: `0/${sum.runs}`, error: sum.firstFailure })
+      // the crashed scenario is not retried (it may crash again); the next ones run in a fresh tab
+      if (lostWhy) await recoverPage(lostWhy)
     }
     // the next browser starts on an idle machine
     await cooldown(serverOk)

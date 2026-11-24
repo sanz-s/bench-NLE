@@ -267,11 +267,14 @@ function startVisibilityWatch() {
 /**
  * Playwright hook: bench/run.mjs exposes `__nleBenchGate(name)` and takes its CDP snapshot inside it, so CDP
  * main-thread time covers only the job (not session setup, verification or reporting). A no-op in the editor.
+ * It also gets the job's server session id, so the runner can stop that session if the page is lost mid-job
+ * (otherwise it would stay open for 180 s and flag the next runs as overlapping).
  */
-async function gate(name) {
+async function gate(name, sessionId) {
   if (typeof globalThis.__nleBenchGate === 'function') {
     try {
-      await globalThis.__nleBenchGate(name)
+      // the session id lets the runner end this job's server session if the page dies mid-job
+      await globalThis.__nleBenchGate(name, sessionId ?? null)
     } catch {
       /* the runner went away */
     }
@@ -321,7 +324,7 @@ export async function runAndReport(job, opts) {
   const pageMemPref = readPref('bench.pageMemory') === '1'
   const memProbe = startPageMemoryProbe(opts.pageMemory ?? pageMemPref)
   const stopVisibility = startVisibilityWatch()
-  await gate('job-start')
+  await gate('job-start', sessionId)
   const wallStart = performance.now()
   let result = null
   let error
@@ -340,7 +343,7 @@ export async function runAndReport(job, opts) {
   // The server takes its last CPU/GPU sample now and ignores later ones, so the tail (waiting for the last
   // main-thread bucket, verification, the report) never dilutes the job's averages.
   if (sessionId) await markSession(sessionId, 'job-end')
-  await gate('job-end')
+  await gate('job-end', sessionId)
   // heap peak: stopped before verification, whose probe + decode would otherwise count as the job's memory
   const memory = await memProbe.stop()
   if (sessionId) await new Promise((r) => setTimeout(r, 150)) // let the final main-thread bucket arrive
